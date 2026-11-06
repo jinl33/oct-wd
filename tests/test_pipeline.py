@@ -259,6 +259,14 @@ def test_scripts(root, tmp):
     assert ckpt["epoch"] == 5 and ckpt["design"] == "w2z1"
     assert all(torch.isfinite(v).all() for v in ckpt["model"].values()), "non-finite weights"
 
+    code, out = run("scripts/sample.py", "--run", run_dir, "--root", root, "--n-samples", "2", "--ddim-steps", "3", "--n-eval", "3")
+    assert code == 0, out
+    no_leak(out, "sample")
+    assert "checkpoint epoch 5, design w2z1" in out and "generated 2 of 2" in out and "images written: 4" in out, out
+    written = sorted(os.path.basename(p) for p in glob.glob(os.path.join(run_dir, "samples", "*.png")))
+    assert written == ["real_000.png", "real_001.png", "sample_000.png", "sample_001.png"], written
+    print(out)
+
     bad = os.path.join(root, "oct_images", "9.9.9.FAKEUID3", "b5.png")
     with open(bad, "wb") as f:
         f.write(b"not a png")

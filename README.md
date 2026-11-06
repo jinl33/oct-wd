@@ -17,6 +17,8 @@ Wavelet diffusion pretraining for retinal OCT.
 | `sbatch jobs/qc_views.sbatch` | Staircase numbers, plus QC images in `~/oct-qc` | Yes |
 | `sbatch jobs/slo_alignment.sbatch` | Whether OCT and SLO line up, numbers only | Yes |
 | `sbatch jobs/train_pilot.sbatch` | Short training run | Yes |
+| `sbatch jobs/train_baseline.sbatch` | Baseline training; resubmit to continue, `EPOCHS` sets the total | Yes |
+| `sbatch jobs/sample.sbatch` | Denoising numbers, plus generated and real images in the run folder; `RUN` picks the run | Yes |
 
 QC images and checkpoints stay on Armis2. Printed logs hold counts and losses only, but read them before sharing.
 

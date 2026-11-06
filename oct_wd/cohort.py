@@ -29,7 +29,6 @@ def folder_names(images_dir):
 
 
 def column_matches(rows, names):
-    """{column: how many rows name an existing folder}. Counts only."""
     if not rows:
         return {}
     return {c: sum(last_part(r[c] or "") in names for r in rows) for c in rows[0] if c}
@@ -53,7 +52,6 @@ def bscan_numbers(folder):
 
 
 def list_scans(root, n_slices=25):
-    """Returns (scans, counts). A scan is kept only if numbered b1..bN with N == n_slices."""
     images_dir, cohort_csv = paths(root)
     rows = read_rows(cohort_csv)
     names = folder_names(images_dir)
@@ -72,13 +70,12 @@ def list_scans(root, n_slices=25):
         elif nums != list(range(1, n_slices + 1)):
             counts["bad_numbering"] += 1
         else:
-            scans.append({"patient": r["anon_id"].strip(), "folder": folder, "n": n_slices})
+            scans.append({"patient": r["anon_id"].strip(), "folder": folder, "n": n_slices, "eye": (r.get("righteye") or "").strip()[:8]})
     counts["kept"] = len(scans)
     return scans, counts
 
 
 def split_by_patient(scans, val_fraction=0.2, seed=42):
-    """No patient appears on both sides."""
     patients = sorted({s["patient"] for s in scans})
     random.Random(seed).shuffle(patients)
     val = set(patients[: round(len(patients) * val_fraction)])

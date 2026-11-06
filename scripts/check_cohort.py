@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import collections
 import csv
@@ -140,5 +139,5 @@ try:
 except SystemExit:
     raise
 except Exception as e:
-    print("stopped early:", type(e).__name__)  # the message itself could contain a path
+    print("stopped early:", type(e).__name__)
     sys.exit(1)

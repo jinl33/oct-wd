@@ -6,7 +6,6 @@ from PIL import Image
 
 
 def load_volume(folder, n):
-    """uint8 (slices, depth, width), stacked by slice number: b1, b2 ... not alphabetically."""
     slices = []
     for i in range(1, n + 1):
         with Image.open(os.path.join(folder, "b%d.png" % i)) as im:
@@ -32,12 +31,11 @@ def pad(x, target, value=-1.0):
 
 
 def depth_shift(p, q, max_shift=40):
-    """Rolling depth profile q by the returned number of pixels best lines it up with p."""
     max_shift = min(max_shift, len(p) // 4)
     p = p - p.mean()
     q = q - q.mean()
     best, best_s = -np.inf, 0
-    for s in sorted(range(-max_shift, max_shift + 1), key=abs):  # ties go to the smallest shift
+    for s in sorted(range(-max_shift, max_shift + 1), key=abs):
         score = float(np.dot(p[max_shift:-max_shift], np.roll(q, s)[max_shift:-max_shift]))
         if score > best:
             best, best_s = score, s
@@ -57,6 +55,5 @@ class OctVolumes(torch.utils.data.Dataset):
         try:
             x = pad(scale(load_volume(s["folder"], s["n"])), self.target)
         except Exception as e:
-            # 'from None' keeps the folder name out of the traceback and the log.
             raise RuntimeError("volume index %d failed: %s" % (i, type(e).__name__)) from None
         return torch.from_numpy(x)[None]

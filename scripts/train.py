@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import json
 import os
@@ -49,7 +48,6 @@ def git_hash():
 
 @torch.no_grad()
 def validate(model, loader, axes, sched, device, use_amp, max_steps):
-    """Same noise and timesteps every time, so values are comparable between epochs."""
     model.eval()
     gen = torch.Generator(device="cpu").manual_seed(1234)
     total, count = 0.0, 0

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import csv
 import glob
 import os
@@ -14,6 +13,7 @@ import torch
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+from oct_wd import alignment as al
 from oct_wd import cohort as co
 from oct_wd import volumes as vo
 from oct_wd import wavelet as wv
@@ -46,7 +46,7 @@ def make_scan(images, name, n, seed, skip=None):
         if b == skip:
             continue
         img = rng.integers(0, 60, (DEPTH, WIDTH))
-        img[20:26] = 200 + b  # a bright layer, so each slice can be told apart
+        img[20:26] = 200 + b
         write_png(os.path.join(d, "b%d.png" % b), img)
     write_png(os.path.join(d, "slo.png"), rng.integers(0, 255, (SLO, SLO)))
     with open(os.path.join(d, "metadata.csv"), "w", newline="") as f:
@@ -60,14 +60,13 @@ def make_tree(root):
     images = os.path.join(root, "oct_images")
     os.makedirs(images)
     rows = []
-    # 12 normal 25-slice scans; patient 0 has two scans, to test the split.
     for i in range(12):
         name = "9.9.9.FAKEUID%d" % i
         make_scan(images, name, 25, i)
         rows.append(("FAKEPATIENT%d" % max(0, i - 1), name, 25))
     make_scan(images, "9.9.9.FAKEUID97", 97, 97)
     rows.append(("FAKEPATIENT97", "9.9.9.FAKEUID97", 97))
-    make_scan(images, "9.9.9.FAKEUIDGAP", 26, 98, skip=7)  # 25 files, but b7 is missing
+    make_scan(images, "9.9.9.FAKEUIDGAP", 26, 98, skip=7)
     rows.append(("FAKEPATIENTGAP", "9.9.9.FAKEUIDGAP", 25))
     with open(os.path.join(root, "pilot_cohort_deidentified.csv"), "w", newline="") as f:
         w = csv.writer(f)
@@ -156,6 +155,43 @@ def test_depth_shift():
     assert abs(vo.depth_shift(p[:48], p[:48])) == 0, "a short profile must not break the window"
 
 
+def fake_aligned(seed):
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(size=(768, 768))
+    for axis in (0, 1):
+        noise = al.uniform_filter1d(noise, 9, axis=axis)
+    slo = np.clip(150 + noise / noise.std() * 40, 0, 255).astype(np.uint8)
+    lines = np.array([[640 - 21.3 * k, 128, 640 - 21.3 * k, 639.33] for k in range(25)])
+    samples = al.sample_slo(slo, lines, 512)
+    vol = np.full((25, 64, 512), 10, dtype=np.uint8)
+    for k in range(25):
+        top = 30 + int(rng.integers(-4, 5))
+        gain = rng.uniform(0.5, 1.0)
+        vol[k, top : top + 10] = np.clip(samples[k] * gain, 0, 255).astype(np.uint8)
+    return vol, slo, lines
+
+
+def test_alignment():
+    vol, slo, lines = fake_aligned(0)
+    view = al.en_face(vol)
+    assert np.allclose(np.median(view, axis=1), 1.0, atol=0.05), "slices should end up equally bright"
+    scores, best = al.alignment_scores(vol, slo, lines)
+    assert scores["as_given"] > 0.8 and max(scores, key=scores.get) == "as_given", scores
+    assert best[1:] == (0, 0), best
+    scores, _ = al.alignment_scores(vol[::-1], slo, lines)
+    assert max(scores, key=scores.get) == "slices_reversed", scores
+    scores, _ = al.alignment_scores(vol[:, :, ::-1], slo, lines)
+    assert max(scores, key=scores.get) == "mirrored", scores
+    scores, _ = al.alignment_scores(vol[::-1, :, ::-1], slo, lines)
+    assert max(scores, key=scores.get) == "both", scores
+    moved = lines + np.array([12, -9, 12, -9])
+    _, best = al.alignment_scores(vol, slo, moved)
+    assert best[1:] == (-12, 9), best
+    _, other_slo, _ = fake_aligned(1)
+    scores, _ = al.alignment_scores(vol, other_slo, lines)
+    assert abs(scores["as_given"]) < 0.2, scores
+
+
 def test_cohort(root):
     scans, counts = co.list_scans(root, 25)
     assert counts["kept"] == 12 and counts["other_slice_count"] == 1 and counts["bad_numbering"] == 1, counts
@@ -180,7 +216,14 @@ def test_scripts(root, tmp):
     code, out = run("scripts/qc_views.py", "--root", root, "--out", qc, "--n-views", "2")
     assert code == 0, out
     no_leak(out, "qc_views")
-    assert len(glob.glob(os.path.join(qc, "qc_*.png"))) == 2, out
+    assert len(glob.glob(os.path.join(qc, "qc_[0-9]*.png"))) == 2, out
+    assert len(glob.glob(os.path.join(qc, "qc_worst_*.png"))) == 12, out
+    print(out)
+
+    code, out = run("scripts/check_slo_alignment.py", "--root", root)
+    assert code == 0, out
+    no_leak(out, "check_slo_alignment")
+    assert "scans checked: 12   failed: 0" in out, out
     print(out)
 
     code, out = run("scripts/probe_memory.py", "--target", "32", "64", "64", "--steps", "1", "--max-batch", "1")
@@ -205,7 +248,6 @@ def test_scripts(root, tmp):
     assert ckpt["epoch"] == 5 and ckpt["design"] == "w2z1"
     assert all(torch.isfinite(v).all() for v in ckpt["model"].values()), "non-finite weights"
 
-    # A broken file must stop the run without the folder name appearing.
     bad = os.path.join(root, "oct_images", "9.9.9.FAKEUID3", "b5.png")
     with open(bad, "wb") as f:
         f.write(b"not a png")
@@ -226,6 +268,7 @@ def main():
             ("slice order", test_slice_order, (root,)),
             ("scale and pad", test_scale_and_pad, ()),
             ("staircase measure", test_depth_shift, ()),
+            ("SLO alignment measure", test_alignment, ()),
             ("cohort and split", test_cohort, (root,)),
             ("scripts end to end", test_scripts, (root, tmp)),
         ):

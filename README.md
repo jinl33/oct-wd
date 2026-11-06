@@ -15,6 +15,7 @@ Wavelet diffusion pretraining for retinal OCT.
 | `python scripts/check_cohort.py` | Cohort and slice-geometry summary, counts and ranges only | Yes |
 | `sbatch jobs/probe_memory.sbatch` | GPU memory on random tensors | No |
 | `sbatch jobs/qc_views.sbatch` | Staircase numbers, plus QC images in `~/oct-qc` | Yes |
+| `sbatch jobs/slo_alignment.sbatch` | Whether OCT and SLO line up, numbers only | Yes |
 | `sbatch jobs/train_pilot.sbatch` | Short training run | Yes |
 
 QC images and checkpoints stay on Armis2. Printed logs hold counts and losses only, but read them before sharing.

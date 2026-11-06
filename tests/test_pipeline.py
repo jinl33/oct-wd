@@ -147,7 +147,7 @@ def test_depth_shift():
     rng = np.random.default_rng(0)
     depth = np.arange(496, dtype=np.float64)
     p = np.exp(-((depth - 200) / 6) ** 2) + 0.5 * np.exp(-((depth - 260) / 10) ** 2) + 0.01 * rng.random(496)
-    for true in (0, 3, 7, 15, 30, -4, -22):
+    for true in (0, 3, 7, 15, 30, 90, -4, -22, -90):
         assert vo.depth_shift(p, np.roll(p, true)) == -true, true
     assert vo.depth_shift(p, p) == 0
     flat = np.full(496, 5.0)
@@ -169,6 +169,16 @@ def fake_aligned(seed):
         gain = rng.uniform(0.5, 1.0)
         vol[k, top : top + 10] = np.clip(samples[k] * gain, 0, 255).astype(np.uint8)
     return vol, slo, lines
+
+
+def test_layer_depths():
+    vol = np.full((5, 200, 64), 10, dtype=np.uint8)
+    tops = [100, 100, 130, 130, 60]
+    for k, top in enumerate(tops):
+        vol[k, top : top + 9] = 200
+    found = vo.layer_depths(vol)
+    assert np.allclose(found, [top + 4 for top in tops], atol=1), found
+    assert list(np.abs(np.diff(found))) == [0, 30, 0, 70], found
 
 
 def test_alignment():
@@ -218,6 +228,7 @@ def test_scripts(root, tmp):
     no_leak(out, "qc_views")
     assert len(glob.glob(os.path.join(qc, "qc_[0-9]*.png"))) == 2, out
     assert len(glob.glob(os.path.join(qc, "qc_worst_*.png"))) == 12, out
+    assert "scans with a slice under half their typical brightness: 0" in out and "share of pixels exactly 0" in out, out
     print(out)
 
     code, out = run("scripts/check_slo_alignment.py", "--root", root)
@@ -268,6 +279,7 @@ def main():
             ("slice order", test_slice_order, (root,)),
             ("scale and pad", test_scale_and_pad, ()),
             ("staircase measure", test_depth_shift, ()),
+            ("bright layer measure", test_layer_depths, ()),
             ("SLO alignment measure", test_alignment, ()),
             ("cohort and split", test_cohort, (root,)),
             ("scripts end to end", test_scripts, (root, tmp)),

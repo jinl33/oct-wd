@@ -3,6 +3,7 @@ import os
 import numpy as np
 import torch
 from PIL import Image
+from scipy.ndimage import uniform_filter1d
 
 
 def load_volume(folder, n):
@@ -30,16 +31,25 @@ def pad(x, target, value=-1.0):
     return np.pad(x, widths, constant_values=value)
 
 
-def depth_shift(p, q, max_shift=40):
-    max_shift = min(max_shift, len(p) // 4)
-    p = p - p.mean()
-    q = q - q.mean()
+def depth_shift(p, q, max_shift=120):
+    n = len(p)
+    max_shift = min(max_shift, n // 4)
     best, best_s = -np.inf, 0
     for s in sorted(range(-max_shift, max_shift + 1), key=abs):
-        score = float(np.dot(p[max_shift:-max_shift], np.roll(q, s)[max_shift:-max_shift]))
+        a = p[s:] if s >= 0 else p[: n + s]
+        b = q[: n - s] if s >= 0 else q[-s:]
+        a = a - a.mean()
+        b = b - b.mean()
+        denom = np.sqrt((a * a).sum() * (b * b).sum())
+        score = float((a * b).sum() / denom) if denom > 0 else 0.0
         if score > best:
             best, best_s = score, s
     return best_s
+
+
+def layer_depths(vol, smooth=9):
+    smoothed = uniform_filter1d(vol.astype(np.float32), smooth, axis=1)
+    return np.median(smoothed.argmax(axis=1), axis=1)
 
 
 class OctVolumes(torch.utils.data.Dataset):

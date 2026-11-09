@@ -10,6 +10,7 @@ import zlib
 
 import numpy as np
 import torch
+from PIL import Image
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -155,6 +156,37 @@ def test_depth_shift():
     assert abs(vo.depth_shift(p[:48], p[:48])) == 0, "a short profile must not break the window"
 
 
+def test_split_steps():
+    rng = np.random.default_rng(0)
+    depth = np.arange(496, dtype=np.float64)
+    p = np.exp(-((depth - 200) / 6) ** 2) + 0.5 * np.exp(-((depth - 260) / 10) ** 2) + 0.01 * rng.random(496)
+
+    def stack(path):
+        return np.stack([np.roll(p, int(round(y))) for y in path])
+
+    slices = np.arange(25)
+    steps = vo.neighbor_steps(stack(5 * slices))
+    assert (np.abs(steps) == 5).all(), steps
+    slope, sudden = vo.split_steps(steps)
+    assert sudden.max() == 0 and (np.abs(slope) == 5).all(), "a steady tilt must not read as a sudden jump"
+
+    _, sudden = vo.split_steps(vo.neighbor_steps(stack(0.1 * (slices - 12) ** 2)))
+    assert sudden.max() <= 1, "a curved retina must not read as a sudden jump: %s" % sudden
+
+    spike = np.zeros(25)
+    spike[12] = 30
+    _, sudden = vo.split_steps(vo.neighbor_steps(stack(spike)))
+    assert sudden.max() == 30 and (sudden >= 5).sum() == 2, "one slice out of line must read at its true size: %s" % sudden
+
+    moved = (slices > 12) * 30.0
+    _, sudden = vo.split_steps(vo.neighbor_steps(stack(moved)))
+    assert sudden.max() == 30 and (sudden >= 5).sum() == 1, "a lasting jump must read at its true size: %s" % sudden
+
+    tilted = 4 * slices + spike
+    _, sudden = vo.split_steps(vo.neighbor_steps(stack(tilted)))
+    assert sudden.max() == 30, "a jump on a tilted retina must read without the tilt: %s" % sudden
+
+
 def fake_aligned(seed):
     rng = np.random.default_rng(seed)
     noise = rng.normal(size=(768, 768))
@@ -231,6 +263,17 @@ def test_scripts(root, tmp):
     assert "scans with a slice under half their typical brightness: 0" in out and "share of pixels exactly 0" in out, out
     print(out)
 
+    stack = os.path.join(tmp, "stack")
+    code, out = run("scripts/stack_views.py", "--root", root, "--out", stack, "--n-views", "2")
+    assert code == 0, out
+    no_leak(out, "stack_views")
+    views = sorted(glob.glob(os.path.join(stack, "stack_*.png")))
+    assert len(views) == 2, out
+    with Image.open(views[0]) as im:
+        assert im.size == (25 * 16 * 3 + 20, DEPTH), im.size
+    assert "scans checked: 12   failed: 0" in out and "scans by largest sudden jump" in out and "view 001:" in out, out
+    print(out)
+
     code, out = run("scripts/check_slo_alignment.py", "--root", root)
     assert code == 0, out
     no_leak(out, "check_slo_alignment")
@@ -287,6 +330,7 @@ def main():
             ("slice order", test_slice_order, (root,)),
             ("scale and pad", test_scale_and_pad, ()),
             ("staircase measure", test_depth_shift, ()),
+            ("slope vs sudden jump measure", test_split_steps, ()),
             ("bright layer measure", test_layer_depths, ()),
             ("SLO alignment measure", test_alignment, ()),
             ("cohort and split", test_cohort, (root,)),

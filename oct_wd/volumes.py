@@ -47,6 +47,15 @@ def depth_shift(p, q, max_shift=120):
     return best_s
 
 
+def neighbor_steps(profile):
+    return np.array([depth_shift(profile[k], profile[k + 1]) for k in range(len(profile) - 1)], dtype=np.float64)
+
+
+def split_steps(steps, window=2):
+    slope = np.array([np.median(steps[max(k - window, 0): k + window + 1]) for k in range(len(steps))])
+    return slope, np.abs(steps - slope)
+
+
 def layer_depths(vol, smooth=9):
     smoothed = uniform_filter1d(vol.astype(np.float32), smooth, axis=1)
     return np.median(smoothed.argmax(axis=1), axis=1)

@@ -15,6 +15,7 @@ Wavelet diffusion pretraining for retinal OCT.
 | `python scripts/check_cohort.py` | Cohort and slice-geometry summary, counts and ranges only | Yes |
 | `sbatch jobs/probe_memory.sbatch` | GPU memory on random tensors | No |
 | `sbatch jobs/qc_views.sbatch` | Staircase numbers, plus QC images in `~/oct-qc` | Yes |
+| `sbatch jobs/stack_views.sbatch` | Slices through the stack for random scans, smooth slope vs sudden jumps, images in `~/oct-qc` | Yes |
 | `sbatch jobs/slo_alignment.sbatch` | Whether OCT and SLO line up, numbers only | Yes |
 | `sbatch jobs/train_pilot.sbatch` | Short training run | Yes |
 | `sbatch jobs/train_baseline.sbatch` | Baseline training; resubmit to continue, `EPOCHS` sets the total | Yes |
@@ -37,4 +38,5 @@ Different on purpose:
 - Anything larger than the target stops with an error instead of being center-cropped.
 - A broken volume stops with an error instead of being replaced with noise.
 - Slices are stacked by number. The split is by patient.
+- No registration, within or between subjects, and no resampling to a physical grid.
 - Checkpoints are written every epoch.

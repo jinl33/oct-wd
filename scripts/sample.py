@@ -55,8 +55,9 @@ def save_view(vol, path):
 
 def describe(label, volumes):
     a = np.concatenate([v.ravel()[::7] for v in volumes])
-    bands = [float(np.abs(np.diff(v, axis=0)).mean()) for v in volumes]
-    print("  %-10s mean %.3f  std %.3f  p50 %.3f  p99 %.3f  black share %.3f  slice-to-slice change %.3f" % (label, a.mean(), a.std(), np.percentile(a, 50), np.percentile(a, 99), (a <= -0.99).mean(), np.mean(bands)))
+    across = np.mean([float(np.abs(np.diff(v, axis=0)).mean()) for v in volumes])
+    within = np.mean([float(np.abs(np.diff(v, axis=2)).mean()) for v in volumes])
+    print("  %-10s mean %.3f  std %.3f  p50 %.3f  p99 %.3f  black share %.3f  slice-to-slice change %.3f  within-slice change %.3f" % (label, a.mean(), a.std(), np.percentile(a, 50), np.percentile(a, 99), (a <= -0.99).mean(), across, within))
 
 
 def main():

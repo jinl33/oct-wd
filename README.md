@@ -16,6 +16,7 @@ Wavelet diffusion pretraining for retinal OCT.
 | `sbatch jobs/probe_memory.sbatch` | GPU memory on random tensors | No |
 | `sbatch jobs/qc_views.sbatch` | Staircase numbers, plus QC images in `~/oct-qc` | Yes |
 | `sbatch jobs/stack_views.sbatch` | Slices through the stack for random scans, smooth slope vs sudden jumps, images in `~/oct-qc` | Yes |
+| `sbatch jobs/dense_check.sbatch` | The same check on the 512- and 97-slice scans, also thinned to 25 slices, plus NIfTI files in `~/oct-qc/nifti` for ITK-SNAP | Yes |
 | `sbatch jobs/slo_alignment.sbatch` | Whether OCT and SLO line up, numbers only | Yes |
 | `sbatch jobs/train_pilot.sbatch` | Short training run | Yes |
 | `sbatch jobs/train_baseline.sbatch` | Baseline training; resubmit to continue, `EPOCHS` sets the total | Yes |

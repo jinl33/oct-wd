@@ -1,5 +1,6 @@
 import csv
 import glob
+import gzip
 import os
 import shutil
 import struct
@@ -273,6 +274,41 @@ def test_scripts(root, tmp):
         assert im.size == (25 * 16 * 3 + 20, DEPTH), im.size
     assert "scans checked: 12   failed: 0" in out and "scans by largest sudden jump" in out and "view 001:" in out, out
     print(out)
+
+    dense = os.path.join(tmp, "dense")
+    code, out = run("scripts/stack_views.py", "--root", root, "--out", dense, "--n-slices", "97")
+    assert code == 0, out
+    no_leak(out, "stack_views dense")
+    assert "as 25 slices, scans by largest sudden jump" in out and "view 000:" in out and "as 25 slices:" in out, out
+    with Image.open(os.path.join(dense, "stack_000.png")) as im:
+        assert im.size == (97 * 4 * 3 + 20, DEPTH), im.size
+    print(out)
+
+    nii = os.path.join(tmp, "nifti")
+    for n_slices, n_views in (("25", "2"), ("97", "1")):
+        code, out = run("scripts/export_nifti.py", "--root", root, "--out", nii, "--n-slices", n_slices, "--n-views", n_views)
+        assert code == 0, out
+        no_leak(out, "export_nifti")
+        assert "spacing values missing 0" in out, out
+        print(out)
+    files = sorted(os.listdir(nii))
+    assert files == ["n25_000.nii.gz", "n25_001.nii.gz", "n97_000.nii.gz"], files
+    for name, n in (("n25_000.nii.gz", 25), ("n97_000.nii.gz", 97)):
+        with gzip.open(os.path.join(nii, name), "rb") as f:
+            raw = f.read()
+        assert len(raw) == 352 + n * DEPTH * WIDTH and raw[344:348] == b"n+1\x00", len(raw)
+        data = np.frombuffer(raw[352:], dtype=np.uint8).reshape(n, DEPTH, WIDTH)
+        assert (data[:, 22, 0] == (201 + np.arange(n)) % 256).all(), "slices must keep their order"
+        try:
+            import nibabel
+        except ImportError:
+            continue
+        img = nibabel.load(os.path.join(nii, name))
+        assert img.shape == (WIDTH, DEPTH, n), img.shape
+        assert (np.asarray(img.dataobj)[0, 22, :] == (201 + np.arange(n)) % 256).all(), "axes must be across, depth, slice"
+        expected = np.array([[0.004, 0, 0, 0], [0, 0, 0.2, 0], [0, -0.01, 0, 0], [0, 0, 0, 1]])
+        assert np.allclose(img.affine, expected, atol=1e-6), img.affine
+        assert np.allclose(img.header.get_qform(), img.header.get_sform(), atol=1e-6), "qform and sform must agree"
 
     code, out = run("scripts/check_slo_alignment.py", "--root", root)
     assert code == 0, out

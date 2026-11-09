@@ -70,7 +70,7 @@ def list_scans(root, n_slices=25):
         elif nums != list(range(1, n_slices + 1)):
             counts["bad_numbering"] += 1
         else:
-            scans.append({"patient": r["anon_id"].strip(), "folder": folder, "n": n_slices, "eye": (r.get("righteye") or "").strip()[:8]})
+            scans.append({"patient": r["anon_id"].strip(), "folder": folder, "n": n_slices, "eye": (r.get("righteye") or "").strip()[:8], "row": r})
     counts["kept"] = len(scans)
     return scans, counts
 

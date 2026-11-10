@@ -49,6 +49,8 @@ The home disk on the 5090 is nearly full. Put the environment, runs and logs on 
     mkdir -p /data/UNIQNAME/oct-runs /data/UNIQNAME/oct-logs /data/UNIQNAME/tmp
     ln -sfn /data/UNIQNAME/oct-logs ~/oct-logs
 
+A reboot drops the mount and stops running jobs. Mount again with the command above, then start each unfinished run with its original command; `--auto-resume` continues from the last epoch. Don't store your UMICH password on the machine to make the mount permanent: everyone with sudo there could read it. The permanent fix is for HITS to add `umms-wilms2` to the automount; ask through Hayagreev.
+
 Keep the scans on the Turbo mount rather than copying them. That leaves one copy to account for, and Hayagreev found `/data` slow.
 
 ## What the pipeline does
@@ -85,12 +87,11 @@ Run these on the RTX 5090, one at a time unless `nvidia-smi` shows room for two.
 
    If a run stops, start the same command again; `--auto-resume` continues from the last epoch.
 
-3. For each finished run, sample and test the heads:
+3. For finished runs, sample and test the heads. One command does it all in order: for each run, sampling, then for `male` and `righteye` a probe and a finetune head, each pretrained and with random init (9 steps per run). The log ends with the number of failed steps.
 
-       bash jobs/lab_run.sh sample_w2z1 scripts/sample.py --run ~/oct-runs/w2z1_slo0
-       bash jobs/lab_run.sh down_male scripts/downstream.py --run ~/oct-runs/w2z1_slo0 --task male
-       bash jobs/lab_run.sh down_eye scripts/downstream.py --run ~/oct-runs/w2z1_slo0 --task righteye
-       bash jobs/lab_run.sh down_male_rand scripts/downstream.py --run ~/oct-runs/w2z1_slo0 --task male --random-init
+       bash jobs/lab_run.sh eval jobs/lab_evaluate.sh ~/oct-runs/w2z1_slo0 ~/oct-runs/w2z1_slo256
+
+On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs`, because the home disk is nearly full.
 
 `male` and `righteye` are the only labels the pilot has. They check that the heads run end to end. They are not research results.
 

@@ -37,6 +37,7 @@ Lab computer, in the background with a log in `~/oct-logs`:
 | `sbatch jobs/sample.sbatch` | Denoising numbers, plus generated and real images in the run folder; `RUN` picks the run | Yes |
 | `sbatch jobs/downstream.sbatch` | Encoder-only features plus a classification or regression head, scored on the test split; `RUN`, `TASKS`, `MODE` (probe or finetune), `EXTRA` | Yes |
 | `bash jobs/lab_run.sh NAME scripts/...` | Any of the scripts above on a lab computer, in the background | Depends on the script |
+| `bash jobs/lab_run.sh NAME jobs/lab_evaluate.sh RUN [RUN ...]` | For each finished run, one after another: sampling, then probe and finetune heads, pretrained and random init. `TASKS`, `MODES`, `SAMPLE_ARGS`, `DOWN_ARGS` | Yes |
 
 QC images and checkpoints stay on Armis2. Printed logs hold counts and losses only, but read them before sharing.
 

@@ -450,6 +450,15 @@ def test_scripts(root, tmp):
     no_leak(out, "downstream with SLO")
     print(out)
 
+    lab_env = dict(ENV, OCT_ROOT=root, PATH=os.path.dirname(sys.executable) + os.pathsep + ENV.get("PATH", ""), TASKS="male",
+                   SAMPLE_ARGS="--n-samples 1 --ddim-steps 2 --n-eval 2", DOWN_ARGS="--workers 0 --n-boot 50 --epochs 1")
+    p = subprocess.run(["bash", "jobs/lab_evaluate.sh", run_dir, slo_dir], cwd=REPO, env=lab_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    out = p.stdout
+    assert p.returncode == 0 and "evaluation finished, failed steps: 0" in out and out.count("test auroc") == 8 and out.count("generated 1 of 1") == 2, out
+    no_leak(out, "lab evaluation")
+    done = sorted(os.listdir(os.path.join(slo_dir, "downstream")))
+    assert {"male_probe_t0", "male_probe_random_t0", "male_finetune_t0", "male_finetune_random_t0"} <= set(done), done
+
     bad = os.path.join(root, "oct_images", "9.9.9.FAKEUID3", "b5.png")
     with open(bad, "wb") as f:
         f.write(b"not a png")

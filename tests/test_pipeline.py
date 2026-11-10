@@ -140,6 +140,12 @@ def test_scale_and_pad():
     x = vo.pad(vo.scale(vol), (32, 512, 512))
     assert x.shape == (32, 512, 512) and x.dtype == np.float32
     assert x.min() == -1 and x.max() == 1
+    rng = np.random.default_rng(1)
+    slo_dir = tempfile.mkdtemp(prefix="oct_wd_slo_")
+    write_png(os.path.join(slo_dir, "slo.png"), rng.integers(0, 255, (96, 96)))
+    slo = vo.load_slo(slo_dir, 64)
+    shutil.rmtree(slo_dir, ignore_errors=True)
+    assert slo.shape == (64, 64) and slo.dtype == np.float32 and slo.min() >= -1 and slo.max() <= 1, (slo.shape, slo.dtype)
     assert (x[:3] == -1).all() and (x[-4:] == -1).all() and (x[3:28, 108:308] == 1).all(), "padding is not centered"
     for fn, args in ((vo.pad, (np.zeros((33, 512, 512)), (32, 512, 512))), (vo.scale, (np.full((3, 3, 3), 7, np.uint8),))):
         try:

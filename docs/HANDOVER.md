@@ -34,30 +34,22 @@ The test uses invented data only and must end with `ALL TESTS PASSED`. If the re
 
 ### Data on a lab computer
 
-The scans live on the sensitive Turbo volume `umms-wilms2`. Armis2 mounts it at `/nfs/turbo/umms-wilms2`. A lab computer can mount the same volume over NFS; nothing goes through Armis2.
+The scans live on the sensitive Turbo volume `umms-wilms2`. Armis2 mounts it at `/nfs/turbo/umms-wilms2`. On the RTX 5090 (RDLU0080), `/nfs/turbo` is an automount whose map (`/etc/auto.turbo`) HITS manages with Ansible, and `umms-wilms2` is not in it. Don't edit that file; HITS overwrites it.
 
-1. Check whether it is already mounted: `findmnt -t nfs,nfs4`. Ask Hayagreev which mount point and options the RTX 6000 uses, and reuse them.
-2. If it isn't mounted, the volume owner (Matthias) or an admin asks ARC through SRS (srs.it.umich.edu) to add the machine to the volume's NFS export list. Give the volume name, the machine's hostname and static IP, Ubuntu, and that HITS cleared the machine for this PHI.
-3. Once the machine is on the export list:
+Mount the volume over SMB instead. This is Hayagreev's method, using the SMB name pattern in ARC's Turbo documentation. The file and folder modes keep the mounted data readable only by you on this shared machine. The mount asks for your UMICH password and lasts until reboot.
 
-       sudo apt install nfs-common
-       sudo mkdir -p /mnt/umms-wilms2
-       sudo mount -t nfs umms-wilms2.turbo.storage.umich.edu:/umms-wilms2 /mnt/umms-wilms2
-       ls /mnt/umms-wilms2
-       echo 'export OCT_ROOT=/mnt/umms-wilms2/OCT-AI' > ~/.oct_paths
+    sudo apt install cifs-utils
+    sudo mkdir -p /mnt/umms-wilms2
+    sudo mount -t cifs -o username=UNIQNAME,domain=UMROOT,sec=ntlmssp,uid=$(id -u),gid=$(id -g),file_mode=0600,dir_mode=0700,vers=3.0 //umms-wilms2-win.turbo.storage.umich.edu/umms-wilms2 /mnt/umms-wilms2
+    echo 'export OCT_ROOT=/mnt/umms-wilms2/OCT_AI' > ~/.oct_paths
 
-   To mount at every boot, add this line to `/etc/fstab`:
+The home disk on the 5090 is nearly full. Put the environment, runs and logs on the large hard disk at `/data`, which is root-owned, so create your own private folder there:
 
-       umms-wilms2.turbo.storage.umich.edu:/umms-wilms2 /mnt/umms-wilms2 nfs defaults,_netdev 0 0
+    sudo mkdir -p /data/UNIQNAME && sudo chown $(id -u):$(id -g) /data/UNIQNAME && chmod 700 /data/UNIQNAME
+    mkdir -p /data/UNIQNAME/oct-runs /data/UNIQNAME/oct-logs /data/UNIQNAME/tmp
+    ln -sfn /data/UNIQNAME/oct-logs ~/oct-logs
 
-   If `ls` shows "permission denied", the local account's user and group numbers don't match the ones on Turbo; HITS or ARC can align them.
-4. **Stopgap until the export is in place:** copy the pilot from Armis2. Run this on the lab computer, so the data is pulled and never pushed:
-
-       mkdir -p ~/oct-data
-       rsync -a --info=progress2 UNIQNAME@armis2.arc-ts.umich.edu:/nfs/turbo/umms-wilms2/OCT-AI/ ~/oct-data/OCT-AI/
-       echo 'export OCT_ROOT=$HOME/oct-data/OCT-AI' > ~/.oct_paths
-
-   Matthias confirmed on 2026-11-04 that the lab computers are cleared to hold copies. Record every copy location in this file, so an audit can see where the data went.
+Keep the scans on the Turbo mount rather than copying them. That leaves one copy to account for, and Hayagreev found `/data` slow.
 
 ## What the pipeline does
 

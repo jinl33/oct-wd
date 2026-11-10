@@ -18,10 +18,10 @@ def load_volume(folder, n):
 
 
 def scale(vol):
-    p1, p99 = np.percentile(vol, [1, 99])
+    p1, p99 = (float(v) for v in np.percentile(vol, [1, 99]))
     if p99 - p1 < 1e-6:
         raise ValueError("constant volume")
-    return np.clip((vol.astype(np.float32) - p1) / (p99 - p1), 0, 1) * 2 - 1
+    return (np.clip((vol.astype(np.float32) - p1) / (p99 - p1), 0, 1) * 2 - 1).astype(np.float32, copy=False)
 
 
 def pad(x, target, value=-1.0):
@@ -64,10 +64,10 @@ def layer_depths(vol, smooth=9):
 def load_slo(folder, size):
     with Image.open(os.path.join(folder, "slo.png")) as im:
         a = np.asarray(im.convert("L").resize((size, size), Image.BILINEAR), dtype=np.float32)
-    low, high = np.percentile(a, [1, 99])
+    low, high = (float(v) for v in np.percentile(a, [1, 99]))
     if high - low < 1e-6:
         raise ValueError("constant SLO")
-    return np.clip((a - low) / (high - low), 0, 1) * 2 - 1
+    return (np.clip((a - low) / (high - low), 0, 1) * 2 - 1).astype(np.float32, copy=False)
 
 
 def other_index(i, n):

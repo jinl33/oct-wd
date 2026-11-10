@@ -10,4 +10,4 @@
 module load python/3.10.4
 source ~/oct-env/bin/activate
 source ~/.oct_paths
-python scripts/sample.py --run "${RUN:-$HOME/oct-runs/baseline_w2z1}"
+python scripts/sample.py --run "${RUN:-$HOME/oct-runs/w2z1_slo0}"

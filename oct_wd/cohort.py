@@ -1,4 +1,5 @@
 import csv
+import math
 import os
 import random
 import re
@@ -75,8 +76,25 @@ def list_scans(root, n_slices=25):
     return scans, counts
 
 
-def split_by_patient(scans, val_fraction=0.2, seed=42):
+def split_by_patient(scans, val_fraction=0.1, test_fraction=0.2, seed=42):
     patients = sorted({s["patient"] for s in scans})
     random.Random(seed).shuffle(patients)
-    val = set(patients[: round(len(patients) * val_fraction)])
-    return [s for s in scans if s["patient"] not in val], [s for s in scans if s["patient"] in val]
+    n_test = round(len(patients) * test_fraction)
+    n_val = round(len(patients) * val_fraction)
+    test = set(patients[:n_test])
+    val = set(patients[n_test: n_test + n_val])
+    train = [s for s in scans if s["patient"] not in test and s["patient"] not in val]
+    return train, [s for s in scans if s["patient"] in val], [s for s in scans if s["patient"] in test]
+
+
+def label(scan, column):
+    raw = (scan["row"].get(column) or "").strip().lower()
+    if raw in ("true", "yes"):
+        return 1.0
+    if raw in ("false", "no"):
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None

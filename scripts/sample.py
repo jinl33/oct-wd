@@ -14,8 +14,8 @@ from generative.networks.schedulers import DDIMScheduler
 from oct_wd import alignment as al
 from oct_wd import cohort as co
 from oct_wd import wavelet as wv
-from oct_wd.model import build_unet
-from oct_wd.volumes import load_volume, pad, scale
+from oct_wd.model import load_checkpoint, predict
+from oct_wd.volumes import load_slo, load_volume, other_index, pad, scale
 
 EVAL_STEPS = (50, 200, 500, 800, 950)
 
@@ -72,18 +72,16 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
-    ckpt = torch.load(os.path.join(args.run, "latest.pt"), map_location=device, weights_only=False)
+    model, ckpt, axes = load_checkpoint(os.path.join(args.run, "latest.pt"), device)
     with open(os.path.join(args.run, "config.json")) as f:
         config = json.load(f)
     with open(os.path.join(args.run, "split.json")) as f:
         val_patients = set(json.load(f)["val"])
-    axes = wv.DESIGNS[ckpt["design"]]
     target = tuple(ckpt["target"])
     grid = wv.check_unet_grid(target, axes)
-    model = build_unet(wv.channels(axes)).to(device)
-    model.load_state_dict(ckpt["model"])
+    slo_size = ckpt.get("slo_size", 0)
     model.eval()
-    print("checkpoint epoch %d, design %s, device %s" % (ckpt["epoch"], ckpt["design"], device))
+    print("checkpoint epoch %d, design %s, SLO %s, device %s" % (ckpt["epoch"], ckpt["design"], "%d px" % slo_size if slo_size else "not used", device))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
     val = [s for s in scans if s["patient"] in val_patients]
@@ -92,49 +90,56 @@ def main():
     out = os.path.join(args.run, "samples")
     os.makedirs(out, exist_ok=True)
 
-    real, clean = [], []
-    for s in val[: max(args.n_eval, args.n_samples)]:
+    real, clean, slos = [], [], []
+    chosen = val[: max(args.n_eval, args.n_samples)]
+    for s in chosen:
         vol = load_volume(s["folder"], s["n"])
         real.append(vol)
         clean.append(wv.forward(torch.from_numpy(pad(scale(vol), target))[None, None], axes))
+        if slo_size:
+            slos.append(torch.from_numpy(load_slo(s["folder"], slo_size))[None])
+    n_samples = min(args.n_samples, len(chosen))
+    conditions = [("own SLO", lambda i: slos[i]), ("other SLO", lambda i: slos[other_index(i, len(slos))]), ("no SLO", lambda i: None)] if slo_size else [("model", lambda i: None)]
     native = real[0].shape
     average = torch.cat(clean).mean(dim=0, keepdim=True)
     ddim = DDIMScheduler(num_train_timesteps=1000, schedule="linear_beta", prediction_type="sample", clip_sample=True)
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
 
     print("denoising on %d validation scans (lower is better; ratio 1 means no better than the average scan):" % len(clean))
-    print("  %-8s %-12s %-14s %s" % ("noise t", "model MSE", "average MSE", "ratio"))
+    print("  %-8s %-14s %s" % ("noise t", "average MSE", "   ".join("ratio, %s" % name for name, _ in conditions)))
     with torch.no_grad():
         for t_value in EVAL_STEPS:
-            model_err, avg_err = 0.0, 0.0
-            for x0 in clean:
+            errs, avg_err = [0.0] * len(conditions), 0.0
+            for i, x0 in enumerate(clean):
                 noise = torch.randn(x0.shape, generator=gen).to(device)
                 t = torch.full((1,), t_value, device=device, dtype=torch.long)
                 noisy = ddim.add_noise(original_samples=x0.to(device), noise=noise, timesteps=t)
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    pred = model(x=noisy, timesteps=t)
-                model_err += torch.nn.functional.mse_loss(pred.float().cpu(), x0).item()
+                for k, (_, pick) in enumerate(conditions):
+                    slo = pick(i)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        pred = predict(model, noisy, t, None if slo is None else slo.to(device))
+                    errs[k] += torch.nn.functional.mse_loss(pred.float().cpu(), x0).item()
                 avg_err += torch.nn.functional.mse_loss(average, x0).item()
-            print("  %-8d %-12.6f %-14.6f %.3f" % (t_value, model_err / len(clean), avg_err / len(clean), model_err / max(avg_err, 1e-12)), flush=True)
+            print("  %-8d %-14.6f %s" % (t_value, avg_err / len(clean), "   ".join("%-14.3f" % (e / max(avg_err, 1e-12)) for e in errs)), flush=True)
 
         ddim.set_timesteps(args.ddim_steps, device=device)
         made = []
-        for i in range(args.n_samples):
+        for i in range(n_samples):
             x = torch.randn((1, wv.channels(axes)) + grid, generator=gen).to(device)
             for t_value in ddim.timesteps:
                 t = torch.full((1,), int(t_value), device=device, dtype=torch.long)
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    pred = model(x=x, timesteps=t)
+                    pred = predict(model, x, t, slos[i].to(device) if slo_size else None)
                 x, _ = ddim.step(pred.float(), int(t_value), x)
             pixels = wv.inverse(x.cpu(), axes)[0, 0].clamp(-1, 1).numpy()
             made.append(unpad(pixels, native))
             save_view(to_uint8(made[-1]), os.path.join(out, "sample_%03d.png" % i))
-            print("generated %d of %d" % (i + 1, args.n_samples), flush=True)
+            print("generated %d of %d%s" % (i + 1, n_samples, " from the SLO of real_%03d" % i if slo_size else ""), flush=True)
 
-    for i, vol in enumerate(real[: args.n_samples]):
+    for i, vol in enumerate(real[:n_samples]):
         save_view(vol, os.path.join(out, "real_%03d.png" % i))
     print("intensity on the -1 to 1 scale:")
-    describe("real", [scale(v) for v in real[: args.n_samples]])
+    describe("real", [scale(v) for v in real[:n_samples]])
     describe("generated", made)
     print("images written:", 2 * len(made))
 

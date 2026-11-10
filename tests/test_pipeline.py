@@ -9,6 +9,8 @@ import sys
 import tempfile
 import zlib
 
+import json
+
 import numpy as np
 import torch
 from PIL import Image
@@ -17,6 +19,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from oct_wd import alignment as al
 from oct_wd import cohort as co
+from oct_wd import evaluate as ev
+from oct_wd import model as mo
 from oct_wd import volumes as vo
 from oct_wd import wavelet as wv
 
@@ -72,11 +76,11 @@ def make_tree(root):
     rows.append(("FAKEPATIENTGAP", "9.9.9.FAKEUIDGAP", 25))
     with open(os.path.join(root, "pilot_cohort_deidentified.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["anon_id", "male", "righteye", "seriesDescription", "datadir", "gaze", "sloHorizontalFieldOfView", "slox", "sloy",
+        w.writerow(["anon_id", "male", "righteye", "age", "seriesDescription", "datadir", "gaze", "sloHorizontalFieldOfView", "slox", "sloy",
                     "sloPixelspacingX", "sloPixelspacingY", "nbscans", "bscanx", "bscany", "duration", "sliceThickness",
                     "bscanPixelspacingWidth", "bscanPixelspacingDepth", "BScanWidthOrRadius", "hasSLO", "hasOCT"])
-        for pid, name, n in rows:
-            w.writerow([pid, 1, 1, name, "/fake/" + name, "x", 30, SLO, SLO, 0.01, 0.01, n, WIDTH, DEPTH, 1, 0.2, 0.01, 0.004, 6, 1, 1])
+        for k, (pid, name, n) in enumerate(rows):
+            w.writerow([pid, ["True", "False"][k % 2], k // 3 % 2, 40 + 3 * k, name, "/fake/" + name, "x", 30, SLO, SLO, 0.01, 0.01, n, WIDTH, DEPTH, 1, 0.2, 0.01, 0.004, 6, 1, 1])
 
 
 def run(*cmd):
@@ -238,12 +242,64 @@ def test_alignment():
 def test_cohort(root):
     scans, counts = co.list_scans(root, 25)
     assert counts["kept"] == 12 and counts["other_slice_count"] == 1 and counts["bad_numbering"] == 1, counts
-    train, val = co.split_by_patient(scans, 0.25)
-    assert not {s["patient"] for s in train} & {s["patient"] for s in val}
-    assert len(train) + len(val) == 12 and val
-    assert co.split_by_patient(scans, 0.25) == (train, val), "split must repeat"
+    train, val, test = co.split_by_patient(scans, 0.2, 0.2)
+    sets = [{s["patient"] for s in part} for part in (train, val, test)]
+    assert not (sets[0] & sets[1] or sets[0] & sets[2] or sets[1] & sets[2]), "patient in two parts"
+    assert len(train) + len(val) + len(test) == 12 and val and test
+    assert [len(x) for x in sets] == [7, 2, 2], [len(x) for x in sets]
+    assert co.split_by_patient(scans, 0.2, 0.2) == (train, val, test), "split must repeat"
     two = [s for s in scans if s["patient"] == "FAKEPATIENT0"]
-    assert len(two) == 2 and len({s in train for s in two}) == 1, "same patient on both sides"
+    assert len(two) == 2 and len({(s in train, s in val) for s in two}) == 1, "same patient on both sides"
+    old_train, old_val = co.split_by_patient(scans, 0.25, 0.0)[:2]
+    assert co.split_by_patient(scans, 0.25, 0.0)[2] == [] and old_val, "a zero test share must leave test empty"
+    big = [{"patient": "P%03d" % i} for i in range(531)]
+    assert [len(x) for x in co.split_by_patient(big)] == [372, 53, 106], "default must be 70/10/20"
+    cases = {"True": 1.0, "false": 0.0, "1": 1.0, "0": 0.0, " 2.5 ": 2.5, "": None, "nan": None, "abc": None}
+    for raw, want in cases.items():
+        assert co.label({"row": {"x": raw}}, "x") == want, raw
+    assert co.label({"row": {}}, "x") is None
+
+
+def test_models():
+    for n in (2, 3, 7):
+        assert all(vo.other_index(i, n) != i for i in range(n)), n
+    x = torch.rand(2, 32, 16, 32, 32) * 2 - 1
+    t = torch.tensor([3, 700])
+    plain = mo.build_model(32).eval()
+    enc = mo.Encoder(plain).eval()
+    seen = {}
+    plain.middle_block.register_forward_hook(lambda m, i, o: seen.update(mid=o))
+    with torch.no_grad():
+        full = plain(x=x, timesteps=t)
+        feats = enc(x, t)
+    assert full.shape == x.shape and feats.shape == (2, enc.dim) and enc.dim == 560, feats.shape
+    assert torch.allclose(feats[:, -160:], seen["mid"].mean(dim=(2, 3, 4)), atol=1e-5), "encoder must match the U-Net's own bottleneck"
+    n_enc = sum(p.numel() for p in enc.parameters())
+    n_all = sum(p.numel() for p in plain.parameters())
+    assert n_enc < 0.6 * n_all, (n_enc, n_all)
+    cond = mo.build_model(32, 64).eval()
+    with torch.no_grad():
+        for prm in cond.parameters():
+            if (prm == 0).all():
+                prm.normal_(0, 0.02)
+    slo = torch.rand(2, 64, 64) * 2 - 1
+    tokens = cond.slo(slo, torch.tensor([True, False]))
+    assert tokens.shape == (2, 64, mo.CONTEXT_DIM)
+    assert torch.equal(tokens[1], cond.slo.null) and not torch.equal(tokens[0], cond.slo.null), "dropped SLO must become the null tokens"
+    with torch.no_grad():
+        own = mo.predict(cond, x, t, slo)
+        swapped = mo.predict(cond, x, t, slo.flip(0))
+        none = mo.predict(cond, x, t, None)
+        feats = mo.Encoder(cond).eval()(x, t, slo)
+    assert own.shape == x.shape and none.shape == x.shape and feats.shape == (2, 560)
+    assert not torch.allclose(own, swapped), "the SLO must reach the U-Net"
+    assert ev.auroc([0, 0, 1, 1], [0.1, 0.4, 0.35, 0.8]) == 0.75
+    assert ev.auroc([1, 1], [0.1, 0.2]) != ev.auroc([1, 1], [0.1, 0.2]), "one class must give nan"
+    low, high = ev.bootstrap("binary", np.array([0, 1] * 20), np.arange(40) % 2 + np.random.default_rng(0).normal(0, 0.5, 40), 200)
+    assert 0.5 < low <= high <= 1.0, (low, high)
+    r = ev.scores("regression", [1, 2, 3], [1, 2, 4])
+    assert abs(r["mae"] - 1 / 3) < 1e-9 and r["pearson_r"] > 0.9
+    assert ev.better("binary", 0.8, 0.7) and ev.better("regression", 1.0, 2.0) and ev.better("binary", 0.6, float("nan"))
 
 
 def test_scripts(root, tmp):
@@ -320,15 +376,27 @@ def test_scripts(root, tmp):
     assert code == 0, out
     print(out)
 
+    code, out = run("scripts/probe_memory.py", "--target", "32", "64", "64", "--steps", "1", "--max-batch", "1", "--designs", "w2z1", "--slo-size", "64")
+    assert code == 0 and "SLO 64 px" in out and "batch  1: OK" in out, out
+
     run_dir = os.path.join(tmp, "run")
-    base = ["scripts/train.py", "--root", root, "--out", run_dir, "--target", "32", "64", "64", "--batch-size", "2", "--workers", "0", "--max-steps", "2", "--val-fraction", "0.25"]
+    base = ["scripts/train.py", "--root", root, "--out", run_dir, "--target", "32", "64", "64", "--batch-size", "2", "--workers", "0", "--max-steps", "2", "--val-fraction", "0.2", "--test-fraction", "0.2"]
     code, out = run(*base, "--epochs", "1")
     assert code == 0, out
     no_leak(out, "train")
-    assert "train scans: 9   validation scans: 3" in out, out
+    scans, _ = co.list_scans(root, 25)
+    parts = co.split_by_patient(scans, 0.2, 0.2)
+    assert "train scans: %d   validation scans: %d   test scans (never used here): %d" % tuple(len(p) for p in parts) in out, out
+    with open(os.path.join(run_dir, "split.json")) as f:
+        saved = json.load(f)
+    assert sorted(saved) == ["test", "train", "val"] and len(saved["test"]) == 2, saved.keys()
     print(out)
     code, out = run(*base, "--epochs", "1")
     assert code != 0 and "already has a checkpoint" in out, "a second run must not overwrite: " + out
+    code, out = run(*base, "--epochs", "2", "--auto-resume", "--test-fraction", "0.3")
+    assert code != 0 and "split differs" in out, "a changed split must not continue a run: " + out
+    code, out = run(*base, "--epochs", "2", "--auto-resume", "--design", "w1z1")
+    assert code != 0 and "trained with design w2z1" in out, out
     code, out = run(*base, "--epochs", "5", "--resume", "--keep", "2")
     assert code == 0 and "resumed after epoch 1" in out and "epoch 5" in out, out
     no_leak(out, "train resume")
@@ -341,15 +409,45 @@ def test_scripts(root, tmp):
     code, out = run("scripts/sample.py", "--run", run_dir, "--root", root, "--n-samples", "2", "--ddim-steps", "3", "--n-eval", "3")
     assert code == 0, out
     no_leak(out, "sample")
-    assert "checkpoint epoch 5, design w2z1" in out and "generated 2 of 2" in out and "images written: 4" in out, out
+    assert "checkpoint epoch 5, design w2z1, SLO not used" in out and "generated 2 of 2" in out and "images written: 4" in out, out
     written = sorted(os.path.basename(p) for p in glob.glob(os.path.join(run_dir, "samples", "*.png")))
     assert written == ["real_000.png", "real_001.png", "sample_000.png", "sample_001.png"], written
+    print(out)
+
+    for extra, want in (([], "test auroc"), (["--random-init"], "random init"), (["--mode", "finetune", "--epochs", "2"], "epoch 2: train loss")):
+        code, out = run("scripts/downstream.py", "--run", run_dir, "--root", root, "--task", "male", "--workers", "0", "--n-boot", "50", *extra)
+        assert code == 0 and want in out and "decoder removed" in out and "positives" in out, out
+        no_leak(out, "downstream")
+        print(out)
+    code, out = run("scripts/downstream.py", "--run", run_dir, "--root", root, "--task", "age", "--kind", "regression", "--workers", "0", "--n-boot", "50", "--t", "50")
+    assert code == 0 and "test mae" in out, out
+    with open(os.path.join(run_dir, "downstream", "age_probe_t50", "results.json")) as f:
+        res = json.load(f)
+    assert res["splits"]["test"]["n"] in (2, 3) and "mae" in res["test"] and len(res["test_ci95"]) == 2, res
+    code, out = run("scripts/downstream.py", "--run", run_dir, "--root", root, "--task", "age", "--workers", "0")
+    assert code != 0 and "is not 0/1" in out, out
+
+    slo_dir = os.path.join(tmp, "run_slo")
+    slo_base = ["scripts/train.py", "--root", root, "--out", slo_dir, "--target", "32", "64", "64", "--batch-size", "2", "--workers", "0", "--max-steps", "2", "--slo-size", "64", "--accum", "2", "--val-fraction", "0.2", "--test-fraction", "0.2"]
+    code, out = run(*slo_base, "--epochs", "1", "--auto-resume")
+    assert code == 0 and "SLO 64 px" in out and "(own SLO)  other SLO" in out and "no SLO" in out, out
+    code, out = run(*slo_base, "--epochs", "2", "--auto-resume")
+    assert code == 0 and "resumed after epoch 1" in out, out
+    no_leak(out, "train with SLO")
+    print(out)
+    code, out = run("scripts/sample.py", "--run", slo_dir, "--root", root, "--n-samples", "1", "--ddim-steps", "2", "--n-eval", "2")
+    assert code == 0 and "ratio, own SLO" in out and "from the SLO of real_000" in out, out
+    no_leak(out, "sample with SLO")
+    print(out)
+    code, out = run("scripts/downstream.py", "--run", slo_dir, "--root", root, "--task", "righteye", "--workers", "0", "--n-boot", "50")
+    assert code == 0 and "SLO 64 px" in out, out
+    no_leak(out, "downstream with SLO")
     print(out)
 
     bad = os.path.join(root, "oct_images", "9.9.9.FAKEUID3", "b5.png")
     with open(bad, "wb") as f:
         f.write(b"not a png")
-    code, out = run("scripts/train.py", "--root", root, "--out", os.path.join(tmp, "run2"), "--target", "32", "64", "64", "--batch-size", "2", "--workers", "0", "--epochs", "1", "--val-fraction", "0.25")
+    code, out = run("scripts/train.py", "--root", root, "--out", os.path.join(tmp, "run2"), "--target", "32", "64", "64", "--batch-size", "2", "--workers", "0", "--epochs", "1", "--val-fraction", "0.25", "--test-fraction", "0")
     assert code != 0 and "failed: UnidentifiedImageError" in out, out
     no_leak(out, "train with a broken file")
 
@@ -370,6 +468,7 @@ def main():
             ("bright layer measure", test_layer_depths, ()),
             ("SLO alignment measure", test_alignment, ()),
             ("cohort and split", test_cohort, (root,)),
+            ("models, encoder and metrics", test_models, ()),
             ("scripts end to end", test_scripts, (root, tmp)),
         ):
             print("--- %s" % name, flush=True)

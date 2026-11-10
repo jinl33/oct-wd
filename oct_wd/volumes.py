@@ -61,10 +61,25 @@ def layer_depths(vol, smooth=9):
     return np.median(smoothed.argmax(axis=1), axis=1)
 
 
+def load_slo(folder, size):
+    with Image.open(os.path.join(folder, "slo.png")) as im:
+        a = np.asarray(im.convert("L").resize((size, size), Image.BILINEAR), dtype=np.float32)
+    low, high = np.percentile(a, [1, 99])
+    if high - low < 1e-6:
+        raise ValueError("constant SLO")
+    return np.clip((a - low) / (high - low), 0, 1) * 2 - 1
+
+
+def other_index(i, n):
+    return (i + n // 2) % n
+
+
 class OctVolumes(torch.utils.data.Dataset):
-    def __init__(self, scans, target):
+    def __init__(self, scans, target, slo_size=0, other=False):
         self.scans = scans
         self.target = tuple(target)
+        self.slo_size = slo_size
+        self.other = other
 
     def __len__(self):
         return len(self.scans)
@@ -72,7 +87,13 @@ class OctVolumes(torch.utils.data.Dataset):
     def __getitem__(self, i):
         s = self.scans[i]
         try:
-            x = pad(scale(load_volume(s["folder"], s["n"])), self.target)
+            x = torch.from_numpy(pad(scale(load_volume(s["folder"], s["n"])), self.target))[None]
+            if not self.slo_size:
+                return x
+            item = (x, torch.from_numpy(load_slo(s["folder"], self.slo_size)))
+            if self.other:
+                j = other_index(i, len(self.scans))
+                item += (torch.from_numpy(load_slo(self.scans[j]["folder"], self.slo_size)),)
         except Exception as e:
             raise RuntimeError("volume index %d failed: %s" % (i, type(e).__name__)) from None
-        return torch.from_numpy(x)[None]
+        return item

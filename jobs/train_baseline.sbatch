@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=oct_base
+#SBATCH --job-name=oct_train
 #SBATCH --account=wilms0
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
@@ -11,7 +11,7 @@ module load python/3.10.4
 source ~/oct-env/bin/activate
 source ~/.oct_paths
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
-OUT=$HOME/oct-runs/baseline_w2z1
-RESUME=""
-if [ -f "$OUT/latest.pt" ]; then RESUME="--resume"; fi
-python scripts/train.py --out "$OUT" --design w2z1 --batch-size 4 --epochs "${EPOCHS:-50}" --workers 4 $RESUME
+DESIGN=${DESIGN:-w2z1}
+SLO=${SLO:-0}
+OUT=${OUT:-$HOME/oct-runs/${DESIGN}_slo${SLO}}
+python scripts/train.py --out "$OUT" --design "$DESIGN" --slo-size "$SLO" --batch-size "${BATCH:-4}" --accum "${ACCUM:-1}" --epochs "${EPOCHS:-200}" --workers 4 --auto-resume

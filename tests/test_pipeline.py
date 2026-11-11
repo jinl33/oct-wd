@@ -416,6 +416,7 @@ def test_scripts(root, tmp):
     assert code == 0, out
     no_leak(out, "sample")
     assert "checkpoint epoch 5, design w2z1, SLO not used" in out and "generated 2 of 2" in out and "images written: 4" in out, out
+    assert "wavelet bands by number of detail axes" in out and "noise added at step 0, 10, 50: 0.010, 0.047, 0.173" in out, out
     written = sorted(os.path.basename(p) for p in glob.glob(os.path.join(run_dir, "samples", "*.png")))
     assert written == ["real_000.png", "real_001.png", "sample_000.png", "sample_001.png"], written
     print(out)
@@ -432,6 +433,27 @@ def test_scripts(root, tmp):
     assert res["splits"]["test"]["n"] in (2, 3) and "mae" in res["test"] and len(res["test_ci95"]) == 2, res
     code, out = run("scripts/downstream.py", "--run", run_dir, "--root", root, "--task", "age", "--workers", "0")
     assert code != 0 and "is not 0/1" in out, out
+
+    few = ["scripts/downstream.py", "--run", run_dir, "--root", root, "--workers", "0", "--n-boot", "50"]
+    code, out = run(*few, "--task", "male", "--label-fraction", "0.5", "--subset-seed", "1")
+    assert code == 0 and "label fraction 0.5, subset 1:" in out and "test auroc" in out, out
+    no_leak(out, "downstream with fewer labels")
+    with open(os.path.join(run_dir, "downstream", "male_probe_t0_f0.5_s1", "results.json")) as f:
+        res = json.load(f)
+    with open(os.path.join(run_dir, "downstream", "male_probe_t0", "results.json")) as f:
+        full = json.load(f)
+    assert res["label_fraction"] == 0.5 and 0 < res["splits"]["train"]["n"] < full["splits"]["train"]["n"], (res["splits"], full["splits"])
+    assert res["splits"]["test"] == full["splits"]["test"] and res["splits"]["val"] == full["splits"]["val"]
+    code, out = run(*few, "--task", "male", "--mode", "finetune", "--epochs", "1", "--label-fraction", "0.5", "--subset-seed", "1")
+    assert code == 0 and "finetune for 2 epochs, validating every 2" in out and "epoch 2: train loss" in out and "epoch 1:" not in out, out
+    code, out = run(*few, "--task", "righteye", "--label-fraction", "0.01")
+    assert code != 0 and "one class only" in out, out
+    code, out = run(*few, "--task", "male", "--label-fraction", "0")
+    assert code != 0 and "must be above 0" in out, out
+    code, out = run("scripts/summarize_downstream.py", "--run", run_dir)
+    assert code == 0 and "random init" in out and "finetune" in out and " 0.5 " in out, out
+    no_leak(out, "summary")
+    print(out)
 
     slo_dir = os.path.join(tmp, "run_slo")
     slo_base = ["scripts/train.py", "--root", root, "--out", slo_dir, "--target", "32", "64", "64", "--batch-size", "2", "--workers", "0", "--max-steps", "2", "--slo-size", "64", "--accum", "2", "--val-fraction", "0.2", "--test-fraction", "0.2"]
@@ -458,6 +480,10 @@ def test_scripts(root, tmp):
     no_leak(out, "lab evaluation")
     done = sorted(os.listdir(os.path.join(slo_dir, "downstream")))
     assert {"male_probe_t0", "male_probe_random_t0", "male_finetune_t0", "male_finetune_random_t0"} <= set(done), done
+    p = subprocess.run(["bash", "jobs/lab_label_fraction.sh", run_dir], cwd=REPO, env=dict(lab_env, FRACTIONS="0.5 1", SEEDS="1", DOWN_ARGS="--workers 0 --n-boot 50"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    out = p.stdout
+    assert p.returncode == 0 and "label-fraction runs finished, failed steps: 0" in out and out.count("test auroc") == 4 and "fraction 0.5 subset 1" in out, out
+    no_leak(out, "label-fraction runs")
 
     bad = os.path.join(root, "oct_images", "9.9.9.FAKEUID3", "b5.png")
     with open(bad, "wb") as f:

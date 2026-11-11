@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import os
+import random
 import sys
 import time
 
@@ -37,6 +38,8 @@ def parse():
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--n-boot", type=int, default=1000)
+    ap.add_argument("--label-fraction", type=float, default=1.0, help="share of training patients whose labels the head sees; finetune epochs scale up so the number of training steps stays about the same")
+    ap.add_argument("--subset-seed", type=int, default=0, help="which random subset of training patients, when --label-fraction is below 1")
     ap.add_argument("--out", default=None)
     return ap.parse_args()
 
@@ -60,6 +63,14 @@ def labelled(scans, task, kind):
     if kind == "binary" and not np.isin(y, (0.0, 1.0)).all():
         raise SystemExit("column %s is not 0/1: %d values outside" % (task, int((~np.isin(y, (0.0, 1.0))).sum())))
     return [s for s, _ in kept], y, len(pairs) - len(kept)
+
+
+def label_subset(scans, y, fraction, seed):
+    patients = sorted({s["patient"] for s in scans})
+    random.Random(seed).shuffle(patients)
+    keep = set(patients[: max(1, round(len(patients) * fraction))])
+    idx = [i for i, s in enumerate(scans) if s["patient"] in keep]
+    return [scans[i] for i in idx], y[idx], len(keep), len(patients)
 
 
 def encoder_input(batch, axes, t, sched, gen, device, slo_size):
@@ -125,6 +136,8 @@ def predict_all(enc, head, loader, args, axes, slo_size, sched, device, use_amp)
 
 def main():
     args = parse()
+    if not 0 < args.label_fraction <= 1:
+        raise SystemExit("--label-fraction must be above 0 and at most 1")
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
@@ -142,7 +155,7 @@ def main():
         model = build_model(wv.channels(axes), slo_size).to(device)
     enc = Encoder(model).to(device)
     del model
-    name = "%s_%s%s_t%d" % (args.task, args.mode, "_random" if args.random_init else "", args.t)
+    name = "%s_%s%s_t%d%s" % (args.task, args.mode, "_random" if args.random_init else "", args.t, "_f%g_s%d" % (args.label_fraction, args.subset_seed) if args.label_fraction < 1 else "")
     out_dir = args.out or os.path.join(args.run, "downstream", name)
     os.makedirs(out_dir, exist_ok=True)
     print("task %s (%s), %s, encoder %s, design %s, SLO %s, noise step %d, feature size %d, device %s" % (
@@ -155,6 +168,11 @@ def main():
     for part in ("train", "val", "test"):
         members = set(split[part])
         parts[part], labels[part], missing = labelled([s for s in scans if s["patient"] in members], args.task, args.kind)
+        if part == "train" and args.label_fraction < 1:
+            parts[part], labels[part], kept, total = label_subset(parts[part], labels[part], args.label_fraction, args.subset_seed)
+            print("label fraction %g, subset %d: %d of %d training patients" % (args.label_fraction, args.subset_seed, kept, total))
+            if args.kind == "binary" and len(set(labels[part].tolist())) < 2:
+                raise SystemExit("the training subset has one class only; use another --subset-seed")
         report[part] = {"n": len(parts[part]), "missing_label": missing}
         if args.kind == "binary":
             report[part]["positives"] = int(labels[part].sum())
@@ -190,10 +208,14 @@ def main():
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         gen = torch.Generator(device="cpu").manual_seed(args.seed)
         val_value, best_epoch, best_state = float("nan"), 0, None
-        for epoch in range(1, args.epochs + 1):
+        every = 1 if args.label_fraction >= 1 else max(1, round(1 / args.label_fraction))
+        epochs = args.epochs * every
+        if every > 1:
+            print("finetune for %d epochs, validating every %d, so the training steps match about %d epochs on all labels" % (epochs, every, args.epochs))
+        total, steps = 0.0, 0
+        for epoch in range(1, epochs + 1):
             enc.train()
             head.train()
-            total, steps = 0.0, 0
             for batch, y in loaders["train"]:
                 x, tt, slo = encoder_input(batch, axes, args.t, sched, gen, device, slo_size)
                 with torch.amp.autocast("cuda", enabled=use_amp):
@@ -207,15 +229,18 @@ def main():
                 scaler.update()
                 total += loss.item()
                 steps += 1
+            if epoch % every:
+                continue
             value = ev.scores(args.kind, labels["val"], back(predict_all(enc, head, loaders["val"], args, axes, slo_size, sched, device, use_amp)))[ev.MAIN[args.kind]]
             print("epoch %d: train loss %.4f  val %s %.4f" % (epoch, total / max(steps, 1), ev.MAIN[args.kind], value), flush=True)
+            total, steps = 0.0, 0
             if best_state is None or ev.better(args.kind, value, val_value):
                 val_value, best_epoch = value, epoch
                 best_state = (copy.deepcopy(enc.state_dict()), copy.deepcopy(head.state_dict()))
         enc.load_state_dict(best_state[0])
         head.load_state_dict(best_state[1])
         test_pred = back(predict_all(enc, head, loaders["test"], args, axes, slo_size, sched, device, use_amp))
-        result["chosen_epoch"] = best_epoch
+        result.update(chosen_epoch=best_epoch, epochs_run=epochs, validate_every=every)
         torch.save({"encoder": best_state[0], "head": best_state[1], "label_mean": mean, "label_std": std}, os.path.join(out_dir, "finetuned.pt"))
 
     test = ev.scores(args.kind, labels["test"], test_pred)

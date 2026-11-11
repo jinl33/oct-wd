@@ -1,6 +1,6 @@
 # OCT wavelet diffusion: handover
 
-Status as of 2026-11-09. Written so that someone else (Hayagreev, or whoever picks this up) can run every step without asking.
+Status as of 2026-11-10. Written so that someone else (Hayagreev, or whoever picks this up) can run every step without asking.
 
 ## The data rule
 
@@ -93,6 +93,12 @@ Run these on the RTX 5090, one at a time unless `nvidia-smi` shows room for two.
 
 On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs`, because the home disk is nearly full.
 
+4. Label fractions: what pretraining buys with few labels. Heads are trained on 10%, 25%, 50% and 100% of the training patients, five random subsets per fraction, pretrained and random init. Validation and test stay whole. Use the eye task on runs without the SLO, because the SLO shows the eye directly. The default is probes only, about an hour per run (estimated). Finetuning (`MODES="probe finetune"`) scales the epochs up as the labels shrink, so every fraction gets about the same number of training steps; each finetune takes about as long as one on all labels.
+
+       bash jobs/lab_run.sh frac jobs/lab_label_fraction.sh ~/oct-runs/w2z1_slo0 ~/oct-runs/w1z1_slo0
+
+   The log ends with a table per run. Print it again at any time with `python scripts/summarize_downstream.py --run RUN`.
+
 `male` and `righteye` are the only labels the pilot has. They check that the heads run end to end. They are not research results.
 
 ### Reading the logs
@@ -101,8 +107,9 @@ On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs
 |---|---|
 | `epoch N: train mse … val mse …` | Diffusion loss. Lower is better. Compare runs of the same design only. The wavelet scaling differs between `w2z1` and `w1z1`, so their losses are on different scales |
 | `val mse X (own SLO)  other SLO Y  no SLO Z` | The SLO test. X clearly below Y means the model uses the SLO |
-| Denoising table in `sample.py` | Ratio of model error to the error of guessing the average scan. Below 1 is better than the average; this ratio can be compared across designs |
+| Denoising table in `sample.py` | Ratio of model error to the error of guessing the average scan. Below 1 is better than the average. Compare within a design only: `wavelet.forward` scales coefficient power to 1/32 of the pixels' in `w2z1` and 1/8 in `w1z1`, while the added noise has the same size, so the same noise step hides more of the scan in `w2z1`. Compare designs on the heads and the generated-scan numbers |
 | `test auroc …` in `downstream.py` | The head on held-out patients. Compare pretrained against `--random-init` |
+| Band table in `sample.py` | Size of the wavelet coefficients, grouped by how many axes are detail (high-pass), for real and generated scans, and the noise added near the end of sampling. A generated / real ratio well below 1 for the detail groups means the model leaves out fine detail |
 
 ## Decisions in force
 
@@ -133,6 +140,48 @@ On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs
 - Samples show a dark area above the retina, a bright band at its base and layered stripes, but are very blurry.
 - The run was continued to 200 epochs on 2026-11-09 under the same older split. Keep it for reference only. It cannot be used for downstream tests, because its training scans include patients that are in the new test split.
 
+**Corrected split on the RTX 5090** (2026-11-10). Split 70/10/20, so 372 training, 53 validation and 106 test scans. 200 epochs, effective batch 4, one seed. Numbers typed back from the logs.
+
+Validation diffusion loss. Compare rows of the same design only.
+
+| Run | Epoch 50 | 100 | 150 | 200 |
+|---|---|---|---|---|
+| `w2z1` | 0.001562 | 0.001479 | 0.001467 | 0.001399 |
+| `w2z1` + SLO, own SLO | 0.001569 | 0.001512 | 0.001431 | 0.001401 |
+| `w2z1` + SLO, another scan's SLO | 0.001572 | 0.001555 | 0.001465 | 0.001417 |
+| `w2z1` + SLO, no SLO | 0.001573 | 0.001520 | 0.001430 | 0.001412 |
+| `w1z1` (batch 2 × accum 2, peak 20.1 GB) | 0.005062 | 0.004604 | 0.004586 | 0.004486 |
+
+Heads on the 106 test scans: AUROC with 95% CI. The CI resamples scans rather than patients, so it is somewhat too narrow.
+
+| Encoder | Task | Probe, pretrained | Probe, random init | Finetune, pretrained | Finetune, random init |
+|---|---|---|---|---|---|
+| `w2z1` | right eye | 0.845 (0.758–0.915) | 0.541 (0.422–0.646) | 0.993 (0.978–1.000) | 0.988 (0.963–1.000) |
+| `w2z1` | male | 0.486 (0.372–0.595) | 0.524 (0.409–0.651) | 0.591 (0.489–0.704) | 0.528 (0.418–0.651) |
+| `w2z1` + SLO | right eye | 0.883 (0.818–0.941) | 0.530 (0.418–0.638) | 0.992 (0.981–0.999) | 0.993 (0.981–1.000) |
+| `w2z1` + SLO | male | 0.503 (0.384–0.615) | 0.493 (0.378–0.602) | 0.566 (0.452–0.679) | 0.580 (0.474–0.686) |
+
+Sampling (denoising on 20 validation scans; 4 generated scans):
+- **Denoising ratio, `w2z1`:** 0.256, 0.291, 0.365, 0.615 and 0.980 at noise steps 50, 200, 500, 800 and 950.
+- **SLO model:** within 0.02 of these with any SLO. Own SLO beats another scan's only at step 800 (0.627 vs 0.631) and step 950 (0.982 vs 0.987).
+- **Smoothness:** generated scans are much smoother than real ones. Mean change between neighbouring pixels within a B-scan is 0.003 against 0.084 real; between slices it is about 0.03 against 0.12.
+- **Background:** real scans are 35% black background; generated scans 26% (`w2z1`) and 16% (SLO model).
+
+What this shows:
+- **Pretraining learned features a head can use.** Frozen pretrained features predict the eye (AUROC 0.85 to 0.88), where frozen random features do not (0.53 to 0.54). Finetuning learns the eye just as well from scratch, so that task cannot separate pretrained from random. Sex is at chance everywhere, as expected with 372 training scans.
+- **The SLO model makes little use of the SLO.**
+  - Own SLO is about 1% better than another scan's at epoch 200, and the model is no better than `w2z1` without an SLO.
+  - A wrong SLO is slightly worse than none from epoch 100 on, so the SLO is not ignored entirely.
+  - The SLO model's eye probe may draw partly on the SLO itself, which shows the optic disc.
+  - In the random-init control the SLO has no effect at all, because MONAI starts the cross-attention output at zero.
+- **Finetuning curves** (from the full evaluation log, one seed):
+  - **Faster with pretraining.** For the eye, `w2z1` finetuning from pretrained weights reaches validation AUROC 0.94 at epoch 5 and 0.99 at epoch 6. From random init it is 0.75 and 0.81 at those epochs, and 0.97 only at epoch 9. Both end at about 0.99.
+  - **The SLO shows the eye directly.** The SLO model learns the eye within 1 to 2 epochs even from random init (0.98 at epoch 2). For SLO models, the eye task does not test the OCT features.
+  - **The SLO model memorises sex.** Its training loss for sex falls to 0.09 (pretrained) and 0.46 (random init), against about 0.68 for `w2z1`, while validation stays near chance. The SLO seems to act as an easy per-person fingerprint.
+  - **Epoch choice by validation AUROC is noise for tasks near chance.** For sex, validation AUROC jumps between 0.39 and 0.71 from epoch to epoch on 53 scans.
+- **Generated scans lack fine texture,** as in the first baseline.
+- The evaluation ran beside `w1z1` without trouble; the GPU showed 24.6 GB in use before it started. With the SLO, the encoder has 10,287,288 parameters.
+
 ## Full pull from Peter (plan from 2026-11-09)
 
 1. **Disease lists (Hayagreev).** For each condition in the grant, the DataDirect MRNs with that diagnosis and an OCT billing code, capped near 1,000 per condition.
@@ -151,7 +200,10 @@ What the pipeline then needs:
 
 - Matthias and Hayagreev count 498 pilot scans; the folders give 531 with 25 B-scans.
 - Which downstream tasks come first, and how controls are defined.
-- After the runs above:
-  - Does `w1z1` beat `w2z1` on the denoising ratio and the heads?
-  - Does the SLO model use the SLO (own vs other)?
+- `w1z1` against `w2z1`: compare on the heads and the generated-scan numbers once `w1z1` is evaluated, not on loss or denoising ratio.
+- Why generated scans lack texture. Untested idea: the extra scaling in `wavelet.forward` (copied from the brain pipeline) makes the fine-detail bands tiny next to the noise, which is 0.17 at step 50, 0.047 at step 10 and 0.01 at step 0. Those bands then add almost nothing to the MSE, and the model can predict near zero for them. Checks: compare the size of each band in generated and real coefficients; sample with 1000 steps instead of 200. Possible fix: scale each band to unit variance before diffusion.
+- A stronger SLO test than the loss: correlate each generated scan's en-face image with its own SLO and with another scan's, using the same measure as the QC (real scans: 0.197 own vs 0.000 other).
+- Bootstrap CIs by patient rather than by scan.
+- Show what pretraining buys with few labels: train the heads on 10%, 25%, 50% and 100% of the training labels, pretrained against random init. The faster finetuning above suggests the gap shows at small fractions. Run with `jobs/lab_label_fraction.sh` (step 4 of the run plan).
+- With 53 validation scans, choose finetune epochs in a steadier way: a fixed number of epochs set in advance, the validation loss, or cross-validation on train plus validation.
 - Next modelling idea: a latent-feature loss alongside the diffusion loss (REPA-style), possibly aligned to SLO features at the matching retinal location.

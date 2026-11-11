@@ -38,6 +38,8 @@ Lab computer, in the background with a log in `~/oct-logs`:
 | `sbatch jobs/downstream.sbatch` | Encoder-only features plus a classification or regression head, scored on the test split; `RUN`, `TASKS`, `MODE` (probe or finetune), `EXTRA` | Yes |
 | `bash jobs/lab_run.sh NAME scripts/...` | Any of the scripts above on a lab computer, in the background | Depends on the script |
 | `bash jobs/lab_run.sh NAME jobs/lab_evaluate.sh RUN [RUN ...]` | For each finished run, one after another: sampling, then probe and finetune heads, pretrained and random init. `TASKS`, `MODES`, `SAMPLE_ARGS`, `DOWN_ARGS` | Yes |
+| `bash jobs/lab_run.sh NAME jobs/lab_label_fraction.sh RUN [RUN ...]` | Heads trained on part of the training patients' labels (`--label-fraction`), several random subsets each, pretrained and random init; ends with a summary table. `TASKS` (default righteye), `MODES` (default probe), `FRACTIONS` (default 0.1 0.25 0.5 1), `SEEDS` (default 0 to 4), `DOWN_ARGS` | Yes |
+| `python scripts/summarize_downstream.py --run RUN [RUN ...]` | One table of every head result in a run: mean, min and max over subsets | No, reads `results.json` only |
 
 QC images and checkpoints stay on Armis2. Printed logs hold counts and losses only, but read them before sharing.
 

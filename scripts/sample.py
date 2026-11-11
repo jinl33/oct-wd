@@ -60,6 +60,18 @@ def describe(label, volumes):
     print("  %-10s mean %.3f  std %.3f  p50 %.3f  p99 %.3f  black share %.3f  slice-to-slice change %.3f  within-slice change %.3f" % (label, a.mean(), a.std(), np.percentile(a, 50), np.percentile(a, 99), (a <= -0.99).mean(), across, within))
 
 
+def band_table(real, made, n_axes, alphas):
+    r = torch.cat(real).float().pow(2).mean(dim=(0, 2, 3, 4))
+    g = torch.cat(made).float().pow(2).mean(dim=(0, 2, 3, 4))
+    print("wavelet bands by number of detail axes (root mean square of coefficients):")
+    print("  %-14s %-6s %-10s %-10s %s" % ("detail axes", "bands", "real", "generated", "generated / real"))
+    for k in range(n_axes + 1):
+        idx = [c for c in range(len(r)) if bin(c).count("1") == k]
+        rr, gg = r[idx].mean().sqrt().item(), g[idx].mean().sqrt().item()
+        print("  %-14d %-6d %-10.4f %-10.4f %.3f" % (k, len(idx), rr, gg, gg / max(rr, 1e-12)))
+    print("  noise added at step 0, 10, 50: %s" % ", ".join("%.3f" % (1 - alphas[t]).sqrt().item() for t in (0, 10, 50)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
@@ -123,7 +135,7 @@ def main():
             print("  %-8d %-14.6f %s" % (t_value, avg_err / len(clean), "   ".join("%-14.3f" % (e / max(avg_err, 1e-12)) for e in errs)), flush=True)
 
         ddim.set_timesteps(args.ddim_steps, device=device)
-        made = []
+        made, made_coefs = [], []
         for i in range(n_samples):
             x = torch.randn((1, wv.channels(axes)) + grid, generator=gen).to(device)
             for t_value in ddim.timesteps:
@@ -131,6 +143,7 @@ def main():
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     pred = predict(model, x, t, slos[i].to(device) if slo_size else None)
                 x, _ = ddim.step(pred.float(), int(t_value), x)
+            made_coefs.append(x.cpu())
             pixels = wv.inverse(x.cpu(), axes)[0, 0].clamp(-1, 1).numpy()
             made.append(unpad(pixels, native))
             save_view(to_uint8(made[-1]), os.path.join(out, "sample_%03d.png" % i))
@@ -141,6 +154,7 @@ def main():
     print("intensity on the -1 to 1 scale:")
     describe("real", [scale(v) for v in real[:n_samples]])
     describe("generated", made)
+    band_table(clean[:n_samples], made_coefs, len(axes), ddim.alphas_cumprod.cpu())
     print("images written:", 2 * len(made))
 
 

@@ -99,6 +99,14 @@ On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs
 
    The log ends with a table per run. Print it again at any time with `python scripts/summarize_downstream.py --run RUN`.
 
+5. Texture fix (decided 2026-11-11): retrain `w2z1` with `--band-scale`. Before training, the run measures each wavelet band's root mean square on the training scans and divides the band by it, so every band reaches the noise at the same size. The sizes are stored in the checkpoint; sampling multiplies them back and the heads divide by them too, so nothing else changes. Then evaluate it the same way as `w2z1`:
+
+       bash jobs/lab_run.sh w2z1_band scripts/train.py --out /data/UNIQNAME/oct-runs/w2z1_band --design w2z1 --batch-size 4 --epochs 200 --auto-resume --band-scale
+       bash jobs/lab_run.sh eval_band jobs/lab_evaluate.sh /data/UNIQNAME/oct-runs/w2z1_band
+       bash jobs/lab_run.sh frac_band jobs/lab_label_fraction.sh /data/UNIQNAME/oct-runs/w2z1_band
+
+   Compare with `w2z1` on the band table, the smoothness numbers, the eye probe and the label-fraction table. Do not compare its validation loss or denoising ratio with `w2z1`: they are in band-scaled units. Its random-init control also sees band-scaled input, so compare the gap between pretrained and random init, not the random-init numbers across runs.
+
 `male` and `righteye` are the only labels the pilot has. They check that the heads run end to end. They are not research results.
 
 ### Reading the logs
@@ -152,7 +160,7 @@ Validation diffusion loss. Compare rows of the same design only.
 | `w2z1` + SLO, no SLO | 0.001573 | 0.001520 | 0.001430 | 0.001412 |
 | `w1z1` (batch 2 × accum 2, peak 20.1 GB) | 0.005062 | 0.004604 | 0.004586 | 0.004486 |
 
-Heads on the 106 test scans: AUROC with 95% CI. The CI resamples scans rather than patients, so it is somewhat too narrow.
+Heads on the 106 test scans: AUROC with 95% CI.
 
 | Encoder | Task | Probe, pretrained | Probe, random init | Finetune, pretrained | Finetune, random init |
 |---|---|---|---|---|---|
@@ -160,6 +168,10 @@ Heads on the 106 test scans: AUROC with 95% CI. The CI resamples scans rather th
 | `w2z1` | male | 0.486 (0.372–0.595) | 0.524 (0.409–0.651) | 0.591 (0.489–0.704) | 0.528 (0.418–0.651) |
 | `w2z1` + SLO | right eye | 0.883 (0.818–0.941) | 0.530 (0.418–0.638) | 0.992 (0.981–0.999) | 0.993 (0.981–1.000) |
 | `w2z1` + SLO | male | 0.503 (0.384–0.615) | 0.493 (0.378–0.602) | 0.566 (0.452–0.679) | 0.580 (0.474–0.686) |
+| `w1z1` | right eye | 0.891 | 0.763 | 0.993 | 0.963 |
+| `w1z1` | male | 0.532 | 0.506 | 0.548 | 0.543 |
+
+The `w1z1` rows come from the summary table, which has no CIs; they are in each `results.json`.
 
 Sampling (denoising on 20 validation scans; 4 generated scans):
 - **Denoising ratio, `w2z1`:** 0.256, 0.291, 0.365, 0.615 and 0.980 at noise steps 50, 200, 500, 800 and 950.
@@ -179,7 +191,55 @@ What this shows:
   - **The SLO shows the eye directly.** The SLO model learns the eye within 1 to 2 epochs even from random init (0.98 at epoch 2). For SLO models, the eye task does not test the OCT features.
   - **The SLO model memorises sex.** Its training loss for sex falls to 0.09 (pretrained) and 0.46 (random init), against about 0.68 for `w2z1`, while validation stays near chance. The SLO seems to act as an easy per-person fingerprint.
   - **Epoch choice by validation AUROC is noise for tasks near chance.** For sex, validation AUROC jumps between 0.39 and 0.71 from epoch to epoch on 53 scans.
-- **Generated scans lack fine texture,** as in the first baseline.
+- **Generated scans lack fine texture,** as in the first baseline. The band table (4 generated scans per run, 2026-11-10) shows where:
+
+  | Detail axes | Real size (`w2z1`) | Generated / real: `w2z1` | SLO model | `w1z1` |
+  |---|---|---|---|---|
+  | 0 (coarse image) | 0.863 | 1.013 | 1.028 | 1.016 |
+  | 1 | 0.048 | 0.799 | 0.840 | 0.770 |
+  | 2 | 0.019 | 0.204 | 0.189 | 0.136 |
+  | 3 | 0.014 | 0.046 | 0.042 | 0.044 |
+  | 4 | 0.011 | 0.018 | 0.014 | none |
+  | 5 | 0.010 | 0.013 | 0.011 | none |
+
+  Coarse content and one-axis detail are reproduced; bands with three or more detail axes, mostly speckle and fine texture, come out at 1 to 5% of their real size. The real fine bands (0.010 to 0.019; 0.017 to 0.027 in `w1z1`) are about the size of the noise added at the last step (0.010) and well below that at step 10 (0.047). This fits the idea that the scaling in `wavelet.forward` hides fine detail under the noise for all but the last few steps and leaves it almost no weight in the loss.
+- **Label fractions** (eye probe, 2026-11-10). Heads trained on part of the training scans, five random subsets per fraction; validation and test stay whole. Test AUROC, mean (min to max):
+
+  | Training scans with labels | `w2z1` pretrained | `w2z1` random init | `w1z1` pretrained | `w1z1` random init |
+  |---|---|---|---|---|
+  | 37 (10%) | 0.760 (0.701–0.807) | 0.547 (0.434–0.662) | 0.801 (0.740–0.830) | 0.567 (0.508–0.652) |
+  | 93 (25%) | 0.808 (0.785–0.831) | 0.545 (0.481–0.646) | 0.849 (0.794–0.878) | 0.627 (0.545–0.679) |
+  | 186 (50%) | 0.840 (0.798–0.870) | 0.556 (0.513–0.619) | 0.868 (0.810–0.901) | 0.707 (0.676–0.735) |
+  | 372 (100%) | 0.845 | 0.541 | 0.891 | 0.763 |
+
+  - **Pretraining is what makes the probe work.** On pretrained features, a linear head learns the eye from 37 scans (0.76 to 0.80). On `w2z1`'s frozen random features it fails even with all 372 (0.54).
+  - **`w1z1` scores higher at every fraction,** by 0.03 to 0.05.
+  - **Part of that is the design itself.** `w1z1`'s random features improve with more labels (0.57 to 0.76), because its finer grid keeps more spatial detail even untrained. So pretraining adds 0.13 to 0.23 for `w1z1` and 0.21 to 0.30 for `w2z1`.
+  - **These are small differences.** There is one easy task and one test set of 106 scans, and the gaps are smaller than a single CI.
+  - **`w1z1` costs more:** 20 GB and about 125 s per epoch, against 9.3 GB and 44 s for `w2z1`.
+
+  Training from scratch with all labels still does better than any probe (finetune from random init, 0.988).
+- **Finetuning at label fractions** (`w2z1`, eye, subsets 0 to 2, finished 2026-11-11). Training steps are matched across fractions. Test AUROC, mean (min to max); the probe column is the mean over subsets 0 to 4 from the table above:
+
+  | Training scans with labels | Probe, pretrained | Finetune, pretrained | Finetune, random init |
+  |---|---|---|---|
+  | 37 (10%) | 0.760 | 0.716 (0.627–0.789) | 0.798 (0.616–0.928) |
+  | 93 (25%) | 0.808 | 0.844 (0.814–0.902) | 0.922 (0.918–0.926) |
+  | 186 (50%) | 0.840 | 0.971 (0.957–0.985) | 0.969 (0.947–0.984) |
+  | 372 (100%) | 0.845 | 0.993 | 0.988 |
+
+  - **From 186 labelled scans up, the start does not matter.** Both reach 0.97 to 0.99.
+  - **Below that, random init scores higher on test.**
+    - At 25% the test ranges still do not overlap (0.918–0.926 against 0.814–0.902), but each run's 95% CI is wide (subset 2 pretrained: 0.902, CI 0.836 to 0.956).
+    - Validation agrees on average (0.942 against 0.879) but not subset by subset. On subset 0, the pretrained run scored higher on validation (best 0.912 against 0.894) but lower on test (about 0.815 against about 0.92).
+    - At 10% the test means are 0.80 against 0.72, but the ranges overlap widely.
+  - **Finetuning the pretrained encoder on few labels gains little over its frozen probe** (0.72 against 0.76 at 10%, 0.84 against 0.81 at 25%).
+  - **Training curves, 25%.**
+    - Subset 0: the pretrained run learns the eye sooner, validation 0.88 at epoch 12 against 0.53 from random init. Subset 2, pretrained: slower, 0.63 at epoch 12 and 0.84 at epoch 16.
+    - Both subset 0 runs fit the 93 training scans completely by epoch 32 (training loss 0.001), and validation then stays flat (0.91 and 0.89). Subset 2 pretrained does the same by epoch 28.
+    - So the idea that pretrained features let the head memorise before the encoder learns does not fit. Random init memorises just as completely, only later.
+  - **What this says.** On the eye task, pretraining clearly helps the frozen probe and speeds up finetuning. With 53 validation and 106 test scans, which start gives the better final finetune at small fractions cannot be told: the two sets rank them differently. The eye is a coarse cue that a network learns from scratch. A diagnosis task is the real test.
+  - **One run failed the first time:** 25% pretrained, subset 2, stopped with a `RuntimeError` while `eval_w1z1` shared the GPU. The script prints only the error type. Rerun alone on 2026-11-11, it finished: test 0.902, validation 0.927, best epoch 64 of 80. A GPU out-of-memory error would have printed `OutOfMemoryError`. `RuntimeError` is what the loader raises when a scan fails to read, or when a loader worker dies, so a read hiccup on the mount is the more likely cause (not confirmed). Running finetunes one at a time on the 5090 is still safer.
 - The evaluation ran beside `w1z1` without trouble; the GPU showed 24.6 GB in use before it started. With the SLO, the encoder has 10,287,288 parameters.
 
 ## Full pull from Peter (plan from 2026-11-09)
@@ -201,9 +261,9 @@ What the pipeline then needs:
 - Matthias and Hayagreev count 498 pilot scans; the folders give 531 with 25 B-scans.
 - Which downstream tasks come first, and how controls are defined.
 - `w1z1` against `w2z1`: compare on the heads and the generated-scan numbers once `w1z1` is evaluated, not on loss or denoising ratio.
-- Why generated scans lack texture. Untested idea: the extra scaling in `wavelet.forward` (copied from the brain pipeline) makes the fine-detail bands tiny next to the noise, which is 0.17 at step 50, 0.047 at step 10 and 0.01 at step 0. Those bands then add almost nothing to the MSE, and the model can predict near zero for them. Checks: compare the size of each band in generated and real coefficients; sample with 1000 steps instead of 200. Possible fix: scale each band to unit variance before diffusion.
+- Generated scans lack texture: measured on 2026-11-10 (band table under Results). If the lost detail is mostly speckle, the features may still serve classification, but small lesions also live at fine scales. Fix started 2026-11-11: `--band-scale` (run plan step 5). Risk to watch: today the coarse image holds about 98% of the coefficient power (from the real band sizes above), so it likely dominates the loss. After scaling it is 1 of 32 equal bands, so layer structure could get worse while texture improves. Check the zero-axes row of the band table and the generated images, not only the fine bands.
 - A stronger SLO test than the loss: correlate each generated scan's en-face image with its own SLO and with another scan's, using the same measure as the QC (real scans: 0.197 own vs 0.000 other).
-- Bootstrap CIs by patient rather than by scan.
-- Show what pretraining buys with few labels: train the heads on 10%, 25%, 50% and 100% of the training labels, pretrained against random init. The faster finetuning above suggests the gap shows at small fractions. Run with `jobs/lab_label_fraction.sh` (step 4 of the run plan).
+- **Does `anon_id` identify a person?** In the pilot each `anon_id` has exactly one scan: the label-fraction runs report 372 training "patients" for 372 training scans. If one person's two eyes, or two visits, carry different `anon_id`s, they can fall on both sides of the split. That cannot leak the eye label, but it would leak person-level labels such as sex or a diagnosis. Ask Hayagreev whether a person-level ID exists for the pilot. For the full pull, the agreed pseudo-ID must be per person. Bootstrap CIs should then resample persons.
+- Label fractions on the eye task are done for `w2z1` (probe and finetune) and `w1z1` (probe). Pretrained finetuning scored lower than random init on test at 10% and 25%, but validation disagrees on at least one subset. The training loss rules out early memorisation by the head. The eye task is too easy and the evaluation sets too small to settle this. Repeat the fractions on a diagnosis task once one is chosen.
 - With 53 validation scans, choose finetune epochs in a steadier way: a fixed number of epochs set in advance, the validation loss, or cross-validation on train plus validation.
 - Next modelling idea: a latent-feature loss alongside the diffusion loss (REPA-style), possibly aligned to SLO features at the matching retinal location.

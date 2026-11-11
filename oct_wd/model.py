@@ -110,3 +110,8 @@ def load_checkpoint(path, device):
     model = build_model(wv.channels(axes), ckpt.get("slo_size", 0))
     model.load_state_dict(ckpt["model"])
     return model.to(device), ckpt, axes
+
+
+def band_scale(ckpt):
+    band = ckpt.get("band_scale")
+    return None if band is None else torch.tensor(band, dtype=torch.float32)

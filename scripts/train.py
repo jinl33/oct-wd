@@ -35,6 +35,7 @@ def parse():
     ap.add_argument("--test-fraction", type=float, default=0.2)
     ap.add_argument("--slo-size", type=int, default=0, help="0 trains without SLO; otherwise the SLO is resized to this size and used as a conditioner")
     ap.add_argument("--slo-drop", type=float, default=0.2, help="share of training steps that see no SLO")
+    ap.add_argument("--band-scale", action="store_true", help="divide each wavelet band by its root mean square on the training scans before noise is added, so fine detail is not buried under the noise; sampling and heads read the sizes from the checkpoint")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-steps", type=int, default=None, help="cap steps per epoch, for smoke tests")
     ap.add_argument("--keep", type=int, default=3, help="number of recent checkpoints to keep")
@@ -60,7 +61,21 @@ def unpack(batch, device, conditioned):
 
 
 @torch.no_grad()
-def validate(model, loader, axes, sched, device, use_amp, max_steps, conditioned):
+def measure_bands(scans, args, axes, device):
+    loader = torch.utils.data.DataLoader(OctVolumes(scans, args.target), batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+    total, values, n = torch.zeros(wv.channels(axes), dtype=torch.float64, device=device), 0, 0
+    for step, vol in enumerate(loader):
+        if args.max_steps and step >= args.max_steps:
+            break
+        x = wv.forward(vol.to(device), axes)
+        total += x.pow(2).sum(dim=(0, 2, 3, 4)).double()
+        values += x[:, 0].numel()
+        n += x.shape[0]
+    return (total / values).sqrt().float().clamp_min(1e-4).cpu(), n
+
+
+@torch.no_grad()
+def validate(model, loader, axes, sched, device, use_amp, max_steps, conditioned, band):
     model.eval()
     gen = torch.Generator(device="cpu").manual_seed(1234)
     names = ("own", "other", "none") if conditioned else ("none",)
@@ -69,7 +84,7 @@ def validate(model, loader, axes, sched, device, use_amp, max_steps, conditioned
         if max_steps and step >= max_steps:
             break
         vol, slo, other = unpack(batch, device, conditioned)
-        x0 = wv.forward(vol, axes)
+        x0 = wv.scaled(wv.forward(vol, axes), band)
         noise = torch.randn(x0.shape, generator=gen).to(device)
         t = torch.randint(0, 1000, (x0.shape[0],), generator=gen).to(device)
         noisy = sched.add_noise(original_samples=x0, noise=noise, timesteps=t)
@@ -102,8 +117,9 @@ def main():
         if not os.path.exists(latest):
             raise SystemExit("--resume was given but %s has no latest.pt" % args.out)
         ckpt = torch.load(latest, map_location=device, weights_only=False)
-        if ckpt["design"] != args.design or ckpt.get("slo_size", 0) != args.slo_size:
-            raise SystemExit("latest.pt was trained with design %s and SLO size %d" % (ckpt["design"], ckpt.get("slo_size", 0)))
+        had_band = ckpt.get("band_scale") is not None
+        if ckpt["design"] != args.design or ckpt.get("slo_size", 0) != args.slo_size or had_band != args.band_scale:
+            raise SystemExit("latest.pt was trained with design %s, SLO size %d, band scaling %s" % (ckpt["design"], ckpt.get("slo_size", 0), "on" if had_band else "off"))
 
     axes = wv.DESIGNS[args.design]
     n_ch = wv.channels(axes)
@@ -131,7 +147,16 @@ def main():
     else:
         with open(split_path, "w") as f:
             json.dump(split, f)
-    record = dict(vars(args), counts=counts, git=git_hash())
+    band = None
+    if args.band_scale:
+        if ckpt is not None:
+            band, source = torch.tensor(ckpt["band_scale"], dtype=torch.float32), "from latest.pt"
+        else:
+            band, n = measure_bands(train_scans, args, axes, device)
+            source = "measured on %d training scans" % n
+        print("band scaling %s: root mean square by number of detail axes %s; smallest band %.4f, largest %.4f" % (
+            source, ", ".join("%d: %.4f" % kv for kv in enumerate(wv.by_detail_axes(band, len(axes)))), band.min().item(), band.max().item()))
+    record = dict(vars(args), counts=counts, git=git_hash(), band_rms=None if band is None else band.tolist())
     if ckpt is None:
         with open(os.path.join(args.out, "config.json"), "w") as f:
             json.dump(record, f, indent=1)
@@ -168,7 +193,7 @@ def main():
             if args.max_steps and step >= args.max_steps:
                 break
             vol, slo, _ = unpack(batch, device, conditioned)
-            x0 = wv.forward(vol, axes)
+            x0 = wv.scaled(wv.forward(vol, axes), band)
             noise = torch.randn_like(x0)
             t = torch.randint(0, 1000, (x0.shape[0],), device=device)
             noisy = sched.add_noise(original_samples=x0, noise=noise, timesteps=t)
@@ -190,7 +215,7 @@ def main():
             steps += 1
         if steps < args.accum:
             raise SystemExit("no optimizer step ran: fewer batches than --accum")
-        val = validate(model, val_loader, axes, sched, device, use_amp, args.max_steps, conditioned)
+        val = validate(model, val_loader, axes, sched, device, use_amp, args.max_steps, conditioned, band)
         peak = torch.cuda.max_memory_allocated() / 2**30 if use_amp else float("nan")
         if conditioned:
             shown = "val mse %.6f (own SLO)  other SLO %.6f  no SLO %.6f" % (val["own"], val["other"], val["none"])
@@ -199,7 +224,7 @@ def main():
         print("epoch %d: train mse %.6f  %s  %.0f s  peak %.2f GiB  steps %d" % (epoch, total / steps, shown, time.time() - started, peak, steps), flush=True)
 
         path = os.path.join(args.out, "epoch_%04d.pt" % epoch)
-        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size}
+        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist()}
         torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
         torch.save(state, latest + ".tmp")

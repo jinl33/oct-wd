@@ -93,6 +93,11 @@ def no_leak(text, where):
         assert word not in text, "%s printed %s" % (where, word)
 
 
+def band_rows(text):
+    lines = text.split("wavelet bands by number of detail axes")[1].splitlines()
+    return [l.split()[2] for l in lines if l.split() and l.split()[0].isdigit()]
+
+
 def test_wavelet():
     x = torch.rand(2, 1, 32, 64, 64, dtype=torch.float64) * 2 - 1
     for name, axes in wv.DESIGNS.items():
@@ -101,6 +106,11 @@ def test_wavelet():
         assert tuple(y.shape[2:]) == wv.grid((32, 64, 64), axes), name
         assert (wv.inverse(y, axes) - x).abs().max() < 1e-10, name
         assert y[:, 0].abs().max() <= 1 + 1e-9, name + " lowest band left [-1, 1]"
+    y = wv.forward(x, wv.DESIGNS["w2z1"])
+    band = torch.rand(32) + 0.01
+    assert (wv.unscaled(wv.scaled(y, band), band) - y).abs().max() < 1e-6 and wv.scaled(y, None) is y
+    assert (wv.scaled(y, band)[:, 5] - y[:, 5] / band[5].item()).abs().max() < 1e-6
+    assert [round(v, 6) for v in wv.by_detail_axes(torch.full((32,), 2.0), 5)] == [2.0] * 6
     assert wv.channels(wv.DESIGNS["w2z1"]) == 32 and wv.check_unet_grid((32, 512, 512), wv.DESIGNS["w2z1"]) == (16, 128, 128)
     assert wv.channels(wv.DESIGNS["w1z1"]) == 8 and wv.check_unet_grid((32, 512, 512), wv.DESIGNS["w1z1"]) == (16, 256, 256)
     for bad in ((25, 512, 512), (24, 512, 512)):
@@ -416,7 +426,8 @@ def test_scripts(root, tmp):
     assert code == 0, out
     no_leak(out, "sample")
     assert "checkpoint epoch 5, design w2z1, SLO not used" in out and "generated 2 of 2" in out and "images written: 4" in out, out
-    assert "wavelet bands by number of detail axes" in out and "noise added at step 0, 10, 50: 0.010, 0.047, 0.173" in out, out
+    assert "wavelet bands by number of detail axes" in out and "noise added at step 0, 10, 50: 0.010, 0.047, 0.173" in out and "band scaling off" in out, out
+    plain_bands = band_rows(out)
     written = sorted(os.path.basename(p) for p in glob.glob(os.path.join(run_dir, "samples", "*.png")))
     assert written == ["real_000.png", "real_001.png", "sample_000.png", "sample_001.png"], written
     print(out)
@@ -471,6 +482,39 @@ def test_scripts(root, tmp):
     assert code == 0 and "SLO 64 px" in out, out
     no_leak(out, "downstream with SLO")
     print(out)
+
+    band_dir = os.path.join(tmp, "run_band")
+    band_base = ["scripts/train.py", "--root", root, "--out", band_dir, "--target", "32", "64", "64", "--batch-size", "2", "--workers", "0", "--val-fraction", "0.2", "--test-fraction", "0.2", "--band-scale"]
+    code, out = run(*band_base, "--epochs", "1")
+    assert code == 0 and "band scaling measured on" in out, out
+    no_leak(out, "train with band scaling")
+    print(out)
+    ckpt = torch.load(os.path.join(band_dir, "latest.pt"), map_location="cpu", weights_only=False)
+    with open(os.path.join(band_dir, "split.json")) as f:
+        train_ids = set(json.load(f)["train"])
+    vols = vo.OctVolumes([s for s in scans if s["patient"] in train_ids], (32, 64, 64))
+    x = wv.scaled(wv.forward(torch.stack([vols[i] for i in range(len(vols))]), wv.DESIGNS["w2z1"]), torch.tensor(ckpt["band_scale"]))
+    rms = x.pow(2).mean(dim=(0, 2, 3, 4)).sqrt()
+    assert len(ckpt["band_scale"]) == 32 and ((rms - 1).abs() < 1e-3).all(), rms
+    with open(os.path.join(band_dir, "config.json")) as f:
+        assert json.load(f)["band_rms"] == ckpt["band_scale"]
+    code, out = run(*band_base, "--epochs", "2", "--auto-resume")
+    assert code == 0 and "resumed after epoch 1" in out and "band scaling from latest.pt" in out, out
+    code, out = run(*band_base[:-1], "--epochs", "3", "--auto-resume")
+    assert code != 0 and "band scaling on" in out, out
+    code, out = run(*base, "--epochs", "6", "--auto-resume", "--band-scale")
+    assert code != 0 and "band scaling off" in out, out
+    code, out = run("scripts/sample.py", "--run", band_dir, "--root", root, "--n-samples", "2", "--ddim-steps", "3", "--n-eval", "3")
+    assert code == 0 and "band scaling on" in out and "generated 2 of 2" in out, out
+    assert band_rows(out) == plain_bands and len(plain_bands) == 6, (band_rows(out), plain_bands)
+    no_leak(out, "sample with band scaling")
+    print(out)
+    for extra in ([], ["--random-init"], ["--mode", "finetune", "--epochs", "1"]):
+        code, out = run("scripts/downstream.py", "--run", band_dir, "--root", root, "--task", "male", "--workers", "0", "--n-boot", "50", *extra)
+        assert code == 0 and "band scaling on" in out and "test auroc" in out, out
+        no_leak(out, "downstream with band scaling")
+    with open(os.path.join(band_dir, "downstream", "male_finetune_t0", "results.json")) as f:
+        assert json.load(f)["band_scale"] is True
 
     lab_env = dict(ENV, OCT_ROOT=root, PATH=os.path.dirname(sys.executable) + os.pathsep + ENV.get("PATH", ""), TASKS="male",
                    SAMPLE_ARGS="--n-samples 1 --ddim-steps 2 --n-eval 2", DOWN_ARGS="--workers 0 --n-boot 50 --epochs 1")

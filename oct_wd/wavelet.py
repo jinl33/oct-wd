@@ -49,3 +49,23 @@ def inverse(y, axes):
         a, b = (low + high) / SQRT2, (low - high) / SQRT2
         y = torch.stack([a, b], dim=ax).flatten(ax - 1, ax)
     return y
+
+
+def band_view(band, x):
+    return band.to(x.device, x.dtype).view(1, -1, *[1] * (x.dim() - 2))
+
+
+def scaled(x, band):
+    return x if band is None else x / band_view(band, x)
+
+
+def unscaled(x, band):
+    return x if band is None else x * band_view(band, x)
+
+
+def by_detail_axes(band, n_axes):
+    out = []
+    for k in range(n_axes + 1):
+        idx = [c for c in range(len(band)) if bin(c).count("1") == k]
+        out.append(band[idx].pow(2).mean().sqrt().item())
+    return out

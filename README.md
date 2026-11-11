@@ -60,5 +60,6 @@ Different on purpose:
 - Slices are stacked by number. The split is by patient: 70% train, 10% validation, 20% test. Pretraining never reads the test part.
 - Downstream heads use the encoder and bottleneck only; the decoder is dropped to save memory.
 - Optional SLO conditioner: a small 2D encoder turns the SLO into 64 tokens that the U-Net reads by cross-attention.
+- Optional band scaling (`train.py --band-scale`): each wavelet band is divided by its root mean square on the training scans before noise is added. The sizes are saved in the checkpoint; `sample.py` multiplies them back, still clipping predictions to [-1, 1] in the original units, and `downstream.py` divides by them before the encoder.
 - No registration, within or between subjects, and no resampling to a physical grid.
 - Checkpoints are written every epoch.

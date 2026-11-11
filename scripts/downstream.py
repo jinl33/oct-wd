@@ -16,7 +16,7 @@ from generative.networks.schedulers import DDPMScheduler
 from oct_wd import cohort as co
 from oct_wd import evaluate as ev
 from oct_wd import wavelet as wv
-from oct_wd.model import Encoder, build_model, load_checkpoint
+from oct_wd.model import Encoder, band_scale, build_model, load_checkpoint
 from oct_wd.volumes import OctVolumes
 
 WEIGHT_DECAYS = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
@@ -73,9 +73,9 @@ def label_subset(scans, y, fraction, seed):
     return [scans[i] for i in idx], y[idx], len(keep), len(patients)
 
 
-def encoder_input(batch, axes, t, sched, gen, device, slo_size):
+def encoder_input(batch, axes, t, sched, gen, device, slo_size, band):
     vol, slo = (batch, None) if not slo_size else (batch[0], batch[1].to(device))
-    x = wv.forward(vol.to(device), axes)
+    x = wv.scaled(wv.forward(vol.to(device), axes), band)
     tt = torch.full((x.shape[0],), t, device=device, dtype=torch.long)
     if t > 0:
         noise = torch.randn(x.shape, generator=gen).to(device)
@@ -90,13 +90,13 @@ def loss_fn(kind, out, y):
 
 
 @torch.no_grad()
-def features(enc, scans, args, axes, target, slo_size, sched, device, use_amp):
+def features(enc, scans, args, axes, target, slo_size, sched, device, use_amp, band):
     enc.eval()
     loader = torch.utils.data.DataLoader(OctVolumes(scans, target, slo_size), batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
     out = []
     for batch in loader:
-        x, tt, slo = encoder_input(batch, axes, args.t, sched, gen, device, slo_size)
+        x, tt, slo = encoder_input(batch, axes, args.t, sched, gen, device, slo_size, band)
         with torch.amp.autocast("cuda", enabled=use_amp):
             out.append(enc(x, tt, slo).cpu().numpy())
     return np.concatenate(out)
@@ -123,12 +123,12 @@ def fit_probe(kind, xtr, ytr, xva, yva, seed, back):
 
 
 @torch.no_grad()
-def predict_all(enc, head, loader, args, axes, slo_size, sched, device, use_amp):
+def predict_all(enc, head, loader, args, axes, slo_size, sched, device, use_amp, band):
     enc.eval()
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
     out = []
     for batch, _ in loader:
-        x, tt, slo = encoder_input(batch, axes, args.t, sched, gen, device, slo_size)
+        x, tt, slo = encoder_input(batch, axes, args.t, sched, gen, device, slo_size, band)
         with torch.amp.autocast("cuda", enabled=use_amp):
             out.append(head(enc(x, tt, slo))[:, 0].float().cpu().numpy())
     return np.concatenate(out)
@@ -149,7 +149,7 @@ def main():
     if "test" not in split:
         raise SystemExit("this run has no test split; pretrain with --test-fraction above 0")
     model, ckpt, axes = load_checkpoint(os.path.join(args.run, "latest.pt"), device)
-    target, slo_size = tuple(ckpt["target"]), ckpt.get("slo_size", 0)
+    target, slo_size, band = tuple(ckpt["target"]), ckpt.get("slo_size", 0), band_scale(ckpt)
     if args.random_init:
         torch.manual_seed(args.seed)
         model = build_model(wv.channels(axes), slo_size).to(device)
@@ -158,9 +158,9 @@ def main():
     name = "%s_%s%s_t%d%s" % (args.task, args.mode, "_random" if args.random_init else "", args.t, "_f%g_s%d" % (args.label_fraction, args.subset_seed) if args.label_fraction < 1 else "")
     out_dir = args.out or os.path.join(args.run, "downstream", name)
     os.makedirs(out_dir, exist_ok=True)
-    print("task %s (%s), %s, encoder %s, design %s, SLO %s, noise step %d, feature size %d, device %s" % (
+    print("task %s (%s), %s, encoder %s, design %s, SLO %s, band scaling %s, noise step %d, feature size %d, device %s" % (
         args.task, args.kind, args.mode, "random init" if args.random_init else "pretrained epoch %d" % ckpt["epoch"],
-        ckpt["design"], "%d px" % slo_size if slo_size else "not used", args.t, enc.dim, device))
+        ckpt["design"], "%d px" % slo_size if slo_size else "not used", "on" if band is not None else "off", args.t, enc.dim, device))
     print("encoder parameters: %d (decoder removed)" % sum(p.numel() for p in enc.parameters()))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
@@ -187,9 +187,9 @@ def main():
 
     sched = DDPMScheduler(num_train_timesteps=1000, schedule="linear_beta", prediction_type="sample")
     started = time.time()
-    result = dict(vars(args), checkpoint_epoch=ckpt["epoch"], design=ckpt["design"], slo_size=slo_size, splits=report)
+    result = dict(vars(args), checkpoint_epoch=ckpt["epoch"], design=ckpt["design"], slo_size=slo_size, band_scale=band is not None, splits=report)
     if args.mode == "probe":
-        feats = {p: features(enc, parts[p], args, axes, target, slo_size, sched, device, use_amp) for p in parts}
+        feats = {p: features(enc, parts[p], args, axes, target, slo_size, sched, device, use_amp, band) for p in parts}
         mu, sd = feats["train"].mean(axis=0), feats["train"].std(axis=0) + 1e-6
         feats = {p: ((v - mu) / sd).astype(np.float32) for p, v in feats.items()}
         ytr = (labels["train"] - mean) / std
@@ -217,7 +217,7 @@ def main():
             enc.train()
             head.train()
             for batch, y in loaders["train"]:
-                x, tt, slo = encoder_input(batch, axes, args.t, sched, gen, device, slo_size)
+                x, tt, slo = encoder_input(batch, axes, args.t, sched, gen, device, slo_size, band)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     out = head(enc(x, tt, slo))[:, 0].float()
                 loss = loss_fn(args.kind, out, y.to(device))
@@ -231,7 +231,7 @@ def main():
                 steps += 1
             if epoch % every:
                 continue
-            value = ev.scores(args.kind, labels["val"], back(predict_all(enc, head, loaders["val"], args, axes, slo_size, sched, device, use_amp)))[ev.MAIN[args.kind]]
+            value = ev.scores(args.kind, labels["val"], back(predict_all(enc, head, loaders["val"], args, axes, slo_size, sched, device, use_amp, band)))[ev.MAIN[args.kind]]
             print("epoch %d: train loss %.4f  val %s %.4f" % (epoch, total / max(steps, 1), ev.MAIN[args.kind], value), flush=True)
             total, steps = 0.0, 0
             if best_state is None or ev.better(args.kind, value, val_value):
@@ -239,7 +239,7 @@ def main():
                 best_state = (copy.deepcopy(enc.state_dict()), copy.deepcopy(head.state_dict()))
         enc.load_state_dict(best_state[0])
         head.load_state_dict(best_state[1])
-        test_pred = back(predict_all(enc, head, loaders["test"], args, axes, slo_size, sched, device, use_amp))
+        test_pred = back(predict_all(enc, head, loaders["test"], args, axes, slo_size, sched, device, use_amp, band))
         result.update(chosen_epoch=best_epoch, epochs_run=epochs, validate_every=every)
         torch.save({"encoder": best_state[0], "head": best_state[1], "label_mean": mean, "label_std": std}, os.path.join(out_dir, "finetuned.pt"))
 

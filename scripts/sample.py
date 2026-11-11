@@ -14,7 +14,7 @@ from generative.networks.schedulers import DDIMScheduler
 from oct_wd import alignment as al
 from oct_wd import cohort as co
 from oct_wd import wavelet as wv
-from oct_wd.model import load_checkpoint, predict
+from oct_wd.model import band_scale, load_checkpoint, predict
 from oct_wd.volumes import load_slo, load_volume, other_index, pad, scale
 
 EVAL_STEPS = (50, 200, 500, 800, 950)
@@ -92,8 +92,9 @@ def main():
     target = tuple(ckpt["target"])
     grid = wv.check_unet_grid(target, axes)
     slo_size = ckpt.get("slo_size", 0)
+    band = band_scale(ckpt)
     model.eval()
-    print("checkpoint epoch %d, design %s, SLO %s, device %s" % (ckpt["epoch"], ckpt["design"], "%d px" % slo_size if slo_size else "not used", device))
+    print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], "%d px" % slo_size if slo_size else "not used", "on" if band is not None else "off", device))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
     val = [s for s in scans if s["patient"] in val_patients]
@@ -107,7 +108,7 @@ def main():
     for s in chosen:
         vol = load_volume(s["folder"], s["n"])
         real.append(vol)
-        clean.append(wv.forward(torch.from_numpy(pad(scale(vol), target))[None, None], axes))
+        clean.append(wv.scaled(wv.forward(torch.from_numpy(pad(scale(vol), target))[None, None], axes), band))
         if slo_size:
             slos.append(torch.from_numpy(load_slo(s["folder"], slo_size))[None])
     n_samples = min(args.n_samples, len(chosen))
@@ -142,9 +143,10 @@ def main():
                 t = torch.full((1,), int(t_value), device=device, dtype=torch.long)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     pred = predict(model, x, t, slos[i].to(device) if slo_size else None)
-                x, _ = ddim.step(pred.float(), int(t_value), x)
-            made_coefs.append(x.cpu())
-            pixels = wv.inverse(x.cpu(), axes)[0, 0].clamp(-1, 1).numpy()
+                x, _ = ddim.step(wv.unscaled(pred.float(), band), int(t_value), wv.unscaled(x, band))
+                x = wv.scaled(x, band)
+            made_coefs.append(wv.unscaled(x, band).cpu())
+            pixels = wv.inverse(made_coefs[-1], axes)[0, 0].clamp(-1, 1).numpy()
             made.append(unpad(pixels, native))
             save_view(to_uint8(made[-1]), os.path.join(out, "sample_%03d.png" % i))
             print("generated %d of %d%s" % (i + 1, n_samples, " from the SLO of real_%03d" % i if slo_size else ""), flush=True)
@@ -154,7 +156,7 @@ def main():
     print("intensity on the -1 to 1 scale:")
     describe("real", [scale(v) for v in real[:n_samples]])
     describe("generated", made)
-    band_table(clean[:n_samples], made_coefs, len(axes), ddim.alphas_cumprod.cpu())
+    band_table([wv.unscaled(c, band) for c in clean[:n_samples]], made_coefs, len(axes), ddim.alphas_cumprod.cpu())
     print("images written:", 2 * len(made))
 
 

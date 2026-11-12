@@ -35,7 +35,7 @@ def parse():
     ap.add_argument("--test-fraction", type=float, default=0.2)
     ap.add_argument("--slo-size", type=int, default=0, help="0 trains without SLO; otherwise the SLO is resized to this size and used as a conditioner")
     ap.add_argument("--slo-drop", type=float, default=0.2, help="share of training steps that see no SLO")
-    ap.add_argument("--band-scale", action="store_true", help="divide each wavelet band by its root mean square on the training scans before noise is added, so fine detail is not buried under the noise; sampling and heads read the sizes from the checkpoint")
+    ap.add_argument("--band-scale", type=float, nargs="?", const=1.0, default=0.0, help="divide each wavelet band by its root mean square on the training scans raised to this power (1 if given alone, 0.5 for the square root) before noise is added, so fine detail is not buried under the noise; sampling and heads read the divisors from the checkpoint")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-steps", type=int, default=None, help="cap steps per epoch, for smoke tests")
     ap.add_argument("--keep", type=int, default=3, help="number of recent checkpoints to keep")
@@ -107,6 +107,8 @@ def main():
     use_amp = device.type == "cuda"
     conditioned = args.slo_size > 0
 
+    if not 0 <= args.band_scale <= 1:
+        raise SystemExit("--band-scale takes a power from 0 to 1")
     latest = os.path.join(args.out, "latest.pt")
     resume = args.resume or (args.auto_resume and os.path.exists(latest))
     if os.path.exists(latest) and not resume:
@@ -117,9 +119,9 @@ def main():
         if not os.path.exists(latest):
             raise SystemExit("--resume was given but %s has no latest.pt" % args.out)
         ckpt = torch.load(latest, map_location=device, weights_only=False)
-        had_band = ckpt.get("band_scale") is not None
-        if ckpt["design"] != args.design or ckpt.get("slo_size", 0) != args.slo_size or had_band != args.band_scale:
-            raise SystemExit("latest.pt was trained with design %s, SLO size %d, band scaling %s" % (ckpt["design"], ckpt.get("slo_size", 0), "on" if had_band else "off"))
+        power = ckpt.get("band_power", 0.0 if ckpt.get("band_scale") is None else 1.0)
+        if ckpt["design"] != args.design or ckpt.get("slo_size", 0) != args.slo_size or power != args.band_scale:
+            raise SystemExit("latest.pt was trained with design %s, SLO size %d, band scaling %s" % (ckpt["design"], ckpt.get("slo_size", 0), "on, power %g" % power if power else "off"))
 
     axes = wv.DESIGNS[args.design]
     n_ch = wv.channels(axes)
@@ -147,16 +149,17 @@ def main():
     else:
         with open(split_path, "w") as f:
             json.dump(split, f)
-    band = None
+    band, rms = None, None
     if args.band_scale:
         if ckpt is not None:
-            band, source = torch.tensor(ckpt["band_scale"], dtype=torch.float32), "from latest.pt"
+            rms, source = torch.tensor(ckpt.get("band_rms") or ckpt["band_scale"], dtype=torch.float32), "from latest.pt"
         else:
-            band, n = measure_bands(train_scans, args, axes, device)
+            rms, n = measure_bands(train_scans, args, axes, device)
             source = "measured on %d training scans" % n
-        print("band scaling %s: root mean square by number of detail axes %s; smallest band %.4f, largest %.4f" % (
-            source, ", ".join("%d: %.4f" % kv for kv in enumerate(wv.by_detail_axes(band, len(axes)))), band.min().item(), band.max().item()))
-    record = dict(vars(args), counts=counts, git=git_hash(), band_rms=None if band is None else band.tolist())
+        band = rms.pow(args.band_scale)
+        print("band scaling %s, power %g: root mean square by number of detail axes %s; smallest band %.4f, largest %.4f" % (
+            source, args.band_scale, ", ".join("%d: %.4f" % kv for kv in enumerate(wv.by_detail_axes(rms, len(axes)))), rms.min().item(), rms.max().item()))
+    record = dict(vars(args), counts=counts, git=git_hash(), band_rms=None if rms is None else rms.tolist())
     if ckpt is None:
         with open(os.path.join(args.out, "config.json"), "w") as f:
             json.dump(record, f, indent=1)
@@ -224,7 +227,7 @@ def main():
         print("epoch %d: train mse %.6f  %s  %.0f s  peak %.2f GiB  steps %d" % (epoch, total / steps, shown, time.time() - started, peak, steps), flush=True)
 
         path = os.path.join(args.out, "epoch_%04d.pt" % epoch)
-        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist()}
+        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist(), "band_rms": None if rms is None else rms.tolist(), "band_power": args.band_scale}
         torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
         torch.save(state, latest + ".tmp")

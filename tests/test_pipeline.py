@@ -497,7 +497,7 @@ def test_scripts(root, tmp):
     rms = x.pow(2).mean(dim=(0, 2, 3, 4)).sqrt()
     assert len(ckpt["band_scale"]) == 32 and ((rms - 1).abs() < 1e-3).all(), rms
     with open(os.path.join(band_dir, "config.json")) as f:
-        assert json.load(f)["band_rms"] == ckpt["band_scale"]
+        assert json.load(f)["band_rms"] == ckpt["band_scale"] == ckpt["band_rms"] and ckpt["band_power"] == 1.0
     code, out = run(*band_base, "--epochs", "2", "--auto-resume")
     assert code == 0 and "resumed after epoch 1" in out and "band scaling from latest.pt" in out, out
     code, out = run(*band_base[:-1], "--epochs", "3", "--auto-resume")
@@ -515,6 +515,26 @@ def test_scripts(root, tmp):
         no_leak(out, "downstream with band scaling")
     with open(os.path.join(band_dir, "downstream", "male_finetune_t0", "results.json")) as f:
         assert json.load(f)["band_scale"] is True
+
+    sqrt_dir = os.path.join(tmp, "run_band_sqrt")
+    sqrt_base = band_base[:4] + [sqrt_dir] + band_base[5:]
+    code, out = run(*sqrt_base, "0.5", "--epochs", "1")
+    assert code == 0 and "band scaling measured on" in out and "power 0.5" in out, out
+    no_leak(out, "train with square-root band scaling")
+    half = torch.load(os.path.join(sqrt_dir, "latest.pt"), map_location="cpu", weights_only=False)
+    assert half["band_power"] == 0.5 and half["band_rms"] == ckpt["band_scale"], (half["band_rms"], ckpt["band_scale"])
+    assert (torch.tensor(half["band_scale"]) - torch.tensor(ckpt["band_scale"]).sqrt()).abs().max() < 1e-6
+    with open(os.path.join(sqrt_dir, "config.json")) as f:
+        assert json.load(f)["band_rms"] == half["band_rms"]
+    code, out = run(*sqrt_base, "0.5", "--epochs", "2", "--auto-resume")
+    assert code == 0 and "resumed after epoch 1" in out and "band scaling from latest.pt, power 0.5" in out, out
+    code, out = run(*sqrt_base, "--epochs", "3", "--auto-resume")
+    assert code != 0 and "band scaling on, power 0.5" in out, out
+    code, out = run(*sqrt_base, "2", "--epochs", "3", "--auto-resume")
+    assert code != 0 and "power from 0 to 1" in out, out
+    code, out = run("scripts/sample.py", "--run", sqrt_dir, "--root", root, "--n-samples", "2", "--ddim-steps", "3", "--n-eval", "3")
+    assert code == 0 and "band scaling on" in out and band_rows(out) == plain_bands, out
+    no_leak(out, "sample with square-root band scaling")
 
     lab_env = dict(ENV, OCT_ROOT=root, PATH=os.path.dirname(sys.executable) + os.pathsep + ENV.get("PATH", ""), TASKS="male",
                    SAMPLE_ARGS="--n-samples 1 --ddim-steps 2 --n-eval 2", DOWN_ARGS="--workers 0 --n-boot 50 --epochs 1")

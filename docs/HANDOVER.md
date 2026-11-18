@@ -133,6 +133,27 @@ On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs
 
    Output goes to `RUN/scan_report`: `cohort.png`, `reconstruction.png`, one `reconstruction_COLUMN.png` per group, `scans.csv` (one row per scan, no IDs) and `worst_*.png` (noisy input, restored and original middle B-scan of the lowest-PSNR scans). View the images on the VM. Noise is added in each run's own wavelet units, so compare groups within a run, not runs with each other. PSNR is the error on a log scale, 10·log10(4 / MSE) on the -1 to 1 scale. Generated scans have no real counterpart, so PSNR does not apply to them.
 
+   Done 2026-11-18 for `w2z1_sqrt` (Results, "Scan report").
+
+8. SLO adapter (proposed to Matthias 2026-11-17, built 2026-11-18): cross-attention reaches only the two deepest levels, and own SLO beat another scan's by about 1%. `--slo-adapter` also feeds the SLO encoder's feature maps from its second stage on into the U-Net encoder at every level. Each map is sampled along every B-scan's line on the SLO (from `metadata.csv`), averaged over each U-Net cell, repeated along depth and added through a 1×1 convolution that starts at zero. From the second stage on, each feature covers more than the gap between two scan lines (receptive field 19, 43 and 91 px at 256, against about 7 px between lines). A pooled SLO vector goes into the time embedding, so SLO content outside the scan area also counts. Padded slices get no SLO features, and dropped-SLO steps (`--slo-drop`) get none either. A new run starts out identical to the cross-attention model.
+
+   First check that every scan has one metadata line per B-scan. `check_cohort.py` prints `row count differs from B-scans: N`, which should be 0. A scan with a mismatch stops the run with `volume index N failed: ValueError`. Then check memory, and train on `w2z1` with square-root band scaling:
+
+       bash jobs/lab_run.sh cohort scripts/check_cohort.py
+       bash jobs/lab_run.sh probe_adapter scripts/probe_memory.py --designs w2z1 --slo-size 256 --slo-adapter --max-batch 8
+       bash jobs/lab_run.sh w2z1_adapter scripts/train.py --out /data/oct_data/oct-runs/w2z1_adapter --design w2z1 --slo-size 256 --slo-adapter --band-scale 0.5 --batch-size 4 --epochs 200 --auto-resume
+
+   The test is in the training log: `val mse X (own SLO)  other SLO Y  no SLO Z`. Own SLO should now be clearly below another scan's (the cross-attention model: about 1%). Then run `lab_evaluate.sh` on it for the denoising ratios with own, other and no SLO. The eye task does not test the OCT features of an SLO model, because the SLO shows the optic disc.
+
+9. 24 slices (Matthias asked 2026-11-17 whether dropping one slice helps; agreed to try it after the SLO change): `--keep-slices 24` keeps B-scans 1 to 24, and `--z-down 0 0 1 1` halves the slice axis only at the last two of the four U-Net downsamplings. With `--target 24 512 512` that gives 12 wavelet slices, then 6 and 3 at the two deepest levels, and padding falls from 24% to 3% of the volume. Halving late keeps the slice axis, already the coarsest (0.25 mm between B-scans), whole while the in-plane cells are still small. By my count it needs about 10% less activation memory than the current 32-slice setup; the probe measures it.
+
+       bash jobs/lab_run.sh probe_24 scripts/probe_memory.py --designs w2z1 --target 24 512 512 --z-down 0 0 1 1 --max-batch 8
+       bash jobs/lab_run.sh w2z1_sqrt24 scripts/train.py --out /data/oct_data/oct-runs/w2z1_sqrt24 --design w2z1 --band-scale 0.5 --batch-size 4 --epochs 200 --auto-resume --keep-slices 24 --target 24 512 512 --z-down 0 0 1 1
+
+   Steps 8 and 9 run back to back with `bash jobs/lab_run.sh next_runs jobs/lab_next_runs.sh /data/oct_data/oct-runs` (started 2026-11-18). A failed step does not stop the next; the log ends with `next runs finished, failed steps: N`.
+
+   Compare with `w2z1_sqrt` on the band table, the intensity numbers, the eye probe at label fractions and the scan report, not on loss: padding is easy to predict, so less of it raises the loss per voxel. The two options combine (`--slo-adapter` with the 24-slice flags).
+
 `male` and `righteye` are the only labels the pilot has. They check that the heads run end to end. They are not research results.
 
 ### Reading the logs
@@ -362,6 +383,20 @@ What this shows:
   - **Finetuning and sex:** eye finetune 0.988 pretrained and 0.983 random init, one seed each. Sex is at chance everywhere (0.52 to 0.59).
   - **One pretraining run per design.** The fixed subsets rule out which patients carry labels as the cause, but how far a second pretraining seed would move these numbers is not measured.
   - **What this says.** On `w1z1`, square-root scaling brings texture back (within-slice change 0.006 to 0.052) but costs the eye probe most where labels are few, and the finest bands stay short of the training-scan sizes. `w2z1_sqrt` keeps its probe, has fine detail at least as close to real, and costs 9.3 GB and 44 s per epoch against 20 GB and 125 s. It stays the main candidate; `w1z1_sqrt` does not earn its cost on this evidence. The eye is a coarse cue, so a diagnosis task could still rank them differently.
+- **Scan report** (`w2z1_sqrt`, 2026-11-18; plots not yet viewed). All 159 validation and test scans read, 321 s. The counts per `male` and `righteye` value match the heads' logs. Median (25th to 75th percentile):
+
+  | Noise step | PSNR, dB | Noisy input PSNR, dB | SSIM |
+  |---|---|---|---|
+  | 50 | 24.71 (22.51–26.11) | 20.30 (20.13–20.44) | 0.653 (0.633–0.674) |
+  | 200 | 21.83 (19.54–23.42) | 9.99 (9.98–10.00) | 0.402 (0.348–0.491) |
+  | 500 | 20.18 (18.08–21.50) | 5.88 (5.75–6.04) | 0.331 (0.238–0.443) |
+
+  - **The model removes most of the added noise:** 4.4, 11.8 and 14.3 dB above the noisy input. 21.8 dB is a root mean square pixel error of about 0.16 on the -1 to 1 scale.
+  - **SSIM falls faster than PSNR.** A one-step restoration is the model's average guess, so it is smooth: speckle hidden under the noise cannot be guessed back, and SSIM penalises missing texture more than PSNR does (inferred).
+  - **No difference by eye** (p 0.33 to 0.87).
+  - **`male` 0 scans restore slightly better than `male` 1:** PSNR 0.4 to 0.9 dB higher (p 0.07 to 0.16), SSIM p 0.026 and 0.032 at steps 200 and 500. None of the 12 comparisons passes a Bonferroni threshold (0.05 / 12 = 0.004), and the pilot has no age or quality score to check for confounding.
+  - **Lowest PSNR at step 200:** 14.7 to 15.7 dB, about 6 dB below the median, in `worst_*.png`.
+  - These PSNR values belong to this test (one step, this run's noise units). They cannot be compared with PSNR values in papers.
 
 ## Full pull from Peter (plan from 2026-11-09)
 

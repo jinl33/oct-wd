@@ -14,8 +14,8 @@ from generative.networks.schedulers import DDIMScheduler
 from oct_wd import alignment as al
 from oct_wd import cohort as co
 from oct_wd import wavelet as wv
-from oct_wd.model import band_scale, load_checkpoint, predict
-from oct_wd.volumes import load_slo, load_volume, other_index, pad, scale
+from oct_wd.model import band_scale, load_checkpoint, options, predict, to_device
+from oct_wd.volumes import as_batch, load_condition, load_volume, other_index, pad, scale, with_other_slo
 
 EVAL_STEPS = (50, 200, 500, 800, 950)
 
@@ -90,11 +90,12 @@ def main():
     with open(os.path.join(args.run, "split.json")) as f:
         val_patients = set(json.load(f)["val"])
     target = tuple(ckpt["target"])
-    grid = wv.check_unet_grid(target, axes)
+    saved = options(ckpt)
+    grid = wv.check_unet_grid(target, axes, saved["z_down"])
     slo_size = ckpt.get("slo_size", 0)
     band = band_scale(ckpt)
     model.eval()
-    print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], "%d px" % slo_size if slo_size else "not used", "on" if band is not None else "off", device))
+    print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], ("%d px" % slo_size + (", adapter" if saved["adapter"] else "")) if slo_size else "not used", "on" if band is not None else "off", device))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
     val = [s for s in scans if s["patient"] in val_patients]
@@ -106,13 +107,13 @@ def main():
     real, clean, slos = [], [], []
     chosen = val[: max(args.n_eval, args.n_samples)]
     for s in chosen:
-        vol = load_volume(s["folder"], s["n"])
+        vol = load_volume(s["folder"], s["n"], saved["keep"])
         real.append(vol)
         clean.append(wv.scaled(wv.forward(torch.from_numpy(pad(scale(vol), target))[None, None], axes), band))
         if slo_size:
-            slos.append(torch.from_numpy(load_slo(s["folder"], slo_size))[None])
+            slos.append(as_batch(load_condition(s["folder"], s["n"], slo_size, saved["adapter"], vol.shape, target, saved["keep"])))
     n_samples = min(args.n_samples, len(chosen))
-    conditions = [("own SLO", lambda i: slos[i]), ("other SLO", lambda i: slos[other_index(i, len(slos))]), ("no SLO", lambda i: None)] if slo_size else [("model", lambda i: None)]
+    conditions = [("own SLO", lambda i: slos[i]), ("other SLO", lambda i: with_other_slo(slos[i], slos[other_index(i, len(slos))])), ("no SLO", lambda i: None)] if slo_size else [("model", lambda i: None)]
     native = real[0].shape
     average = torch.cat(clean).mean(dim=0, keepdim=True)
     ddim = DDIMScheduler(num_train_timesteps=1000, schedule="linear_beta", prediction_type="sample", clip_sample=True)
@@ -130,7 +131,7 @@ def main():
                 for k, (_, pick) in enumerate(conditions):
                     slo = pick(i)
                     with torch.amp.autocast("cuda", enabled=use_amp):
-                        pred = predict(model, noisy, t, None if slo is None else slo.to(device))
+                        pred = predict(model, noisy, t, to_device(slo, device))
                     errs[k] += torch.nn.functional.mse_loss(pred.float().cpu(), x0).item()
                 avg_err += torch.nn.functional.mse_loss(average, x0).item()
             print("  %-8d %-14.6f %s" % (t_value, avg_err / len(clean), "   ".join("%-14.3f" % (e / max(avg_err, 1e-12)) for e in errs)), flush=True)
@@ -142,7 +143,7 @@ def main():
             for t_value in ddim.timesteps:
                 t = torch.full((1,), int(t_value), device=device, dtype=torch.long)
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    pred = predict(model, x, t, slos[i].to(device) if slo_size else None)
+                    pred = predict(model, x, t, to_device(slos[i], device) if slo_size else None)
                 x, _ = ddim.step(wv.unscaled(pred.float(), band), int(t_value), wv.unscaled(x, band))
                 x = wv.scaled(x, band)
             made_coefs.append(wv.unscaled(x, band).cpu())

@@ -18,8 +18,8 @@ from generative.networks.schedulers import DDIMScheduler
 from oct_wd import cohort as co
 from oct_wd import evaluate as ev
 from oct_wd import wavelet as wv
-from oct_wd.model import band_scale, load_checkpoint, predict
-from oct_wd.volumes import load_slo, load_volume, pad, scale
+from oct_wd.model import band_scale, load_checkpoint, options, predict, to_device
+from oct_wd.volumes import as_batch, load_condition, load_volume, pad, scale
 
 PARTS = ("train", "val", "test")
 METRICS = (("psnr", "PSNR (dB)"), ("ssim", "SSIM"))
@@ -189,8 +189,8 @@ def main():
     empty = [p for p in args.parts if not split.get(p)]
     if empty:
         raise SystemExit("this run's split has no %s scans" % " or ".join(empty))
-    target, slo_size, band = tuple(ckpt["target"]), ckpt.get("slo_size", 0), band_scale(ckpt)
-    print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], "%d px" % slo_size if slo_size else "not used", "on" if band is not None else "off", device))
+    target, slo_size, band, saved = tuple(ckpt["target"]), ckpt.get("slo_size", 0), band_scale(ckpt), options(ckpt)
+    print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], ("%d px" % slo_size + (", adapter" if saved["adapter"] else "")) if slo_size else "not used", "on" if band is not None else "off", device))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
     part_of = {pid: p for p in PARTS for pid in split.get(p, [])}
@@ -221,8 +221,8 @@ def main():
         for k, i in enumerate(chosen):
             s = scans[i]
             try:
-                real = scale(load_volume(s["folder"], s["n"]))
-                slo = torch.from_numpy(load_slo(s["folder"], slo_size))[None].to(device) if slo_size else None
+                real = scale(load_volume(s["folder"], s["n"], saved["keep"]))
+                slo = to_device(as_batch(load_condition(s["folder"], s["n"], slo_size, saved["adapter"], real.shape, target, saved["keep"])), device)
             except Exception as e:
                 failed += 1
                 print("scan %d of %d could not be read: %s" % (k + 1, len(chosen), type(e).__name__))

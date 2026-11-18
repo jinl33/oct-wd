@@ -16,7 +16,7 @@ from generative.networks.schedulers import DDPMScheduler
 from oct_wd import cohort as co
 from oct_wd import evaluate as ev
 from oct_wd import wavelet as wv
-from oct_wd.model import Encoder, band_scale, build_model, load_checkpoint
+from oct_wd.model import Encoder, band_scale, build_model, load_checkpoint, options, to_device
 from oct_wd.volumes import OctVolumes
 
 WEIGHT_DECAYS = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
@@ -74,7 +74,7 @@ def label_subset(scans, y, fraction, seed):
 
 
 def encoder_input(batch, axes, t, sched, gen, device, slo_size, band):
-    vol, slo = (batch, None) if not slo_size else (batch[0], batch[1].to(device))
+    vol, slo = (batch, None) if not slo_size else (batch[0], to_device(batch[1], device))
     x = wv.scaled(wv.forward(vol.to(device), axes), band)
     tt = torch.full((x.shape[0],), t, device=device, dtype=torch.long)
     if t > 0:
@@ -90,9 +90,9 @@ def loss_fn(kind, out, y):
 
 
 @torch.no_grad()
-def features(enc, scans, args, axes, target, slo_size, sched, device, use_amp, band):
+def features(enc, volumes, args, axes, slo_size, sched, device, use_amp, band):
     enc.eval()
-    loader = torch.utils.data.DataLoader(OctVolumes(scans, target, slo_size), batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+    loader = torch.utils.data.DataLoader(volumes, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
     out = []
     for batch in loader:
@@ -149,10 +149,10 @@ def main():
     if "test" not in split:
         raise SystemExit("this run has no test split; pretrain with --test-fraction above 0")
     model, ckpt, axes = load_checkpoint(os.path.join(args.run, "latest.pt"), device)
-    target, slo_size, band = tuple(ckpt["target"]), ckpt.get("slo_size", 0), band_scale(ckpt)
+    target, slo_size, band, saved = tuple(ckpt["target"]), ckpt.get("slo_size", 0), band_scale(ckpt), options(ckpt)
     if args.random_init:
         torch.manual_seed(args.seed)
-        model = build_model(wv.channels(axes), slo_size).to(device)
+        model = build_model(wv.channels(axes), slo_size, saved["adapter"], saved["z_down"]).to(device)
     enc = Encoder(model).to(device)
     del model
     name = "%s_%s%s_t%d%s" % (args.task, args.mode, "_random" if args.random_init else "", args.t, "_f%g_s%d" % (args.label_fraction, args.subset_seed) if args.label_fraction < 1 else "")
@@ -160,7 +160,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     print("task %s (%s), %s, encoder %s, design %s, SLO %s, band scaling %s, noise step %d, feature size %d, device %s" % (
         args.task, args.kind, args.mode, "random init" if args.random_init else "pretrained epoch %d" % ckpt["epoch"],
-        ckpt["design"], "%d px" % slo_size if slo_size else "not used", "on" if band is not None else "off", args.t, enc.dim, device))
+        ckpt["design"], ("%d px" % slo_size + (", adapter" if saved["adapter"] else "")) if slo_size else "not used", "on" if band is not None else "off", args.t, enc.dim, device))
     print("encoder parameters: %d (decoder removed)" % sum(p.numel() for p in enc.parameters()))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
@@ -187,9 +187,13 @@ def main():
 
     sched = DDPMScheduler(num_train_timesteps=1000, schedule="linear_beta", prediction_type="sample")
     started = time.time()
-    result = dict(vars(args), checkpoint_epoch=ckpt["epoch"], design=ckpt["design"], slo_size=slo_size, band_scale=band is not None, splits=report)
+    result = dict(vars(args), checkpoint_epoch=ckpt["epoch"], design=ckpt["design"], slo_size=slo_size, band_scale=band is not None, slo_adapter=saved["adapter"], keep_slices=saved["keep"], z_down=list(saved["z_down"]), splits=report)
+
+    def volumes(scans):
+        return OctVolumes(scans, target, slo_size, adapter=saved["adapter"], keep=saved["keep"])
+
     if args.mode == "probe":
-        feats = {p: features(enc, parts[p], args, axes, target, slo_size, sched, device, use_amp, band) for p in parts}
+        feats = {p: features(enc, volumes(parts[p]), args, axes, slo_size, sched, device, use_amp, band) for p in parts}
         mu, sd = feats["train"].mean(axis=0), feats["train"].std(axis=0) + 1e-6
         feats = {p: ((v - mu) / sd).astype(np.float32) for p, v in feats.items()}
         ytr = (labels["train"] - mean) / std
@@ -203,7 +207,7 @@ def main():
         loaders = {}
         for p in parts:
             y = ((labels[p] - mean) / std).astype(np.float32)
-            loaders[p] = torch.utils.data.DataLoader(Labelled(OctVolumes(parts[p], target, slo_size), y), batch_size=args.batch_size, shuffle=p == "train", drop_last=p == "train" and len(parts[p]) > args.batch_size, num_workers=args.workers)
+            loaders[p] = torch.utils.data.DataLoader(Labelled(volumes(parts[p]), y), batch_size=args.batch_size, shuffle=p == "train", drop_last=p == "train" and len(parts[p]) > args.batch_size, num_workers=args.workers)
         opt = torch.optim.AdamW([{"params": enc.parameters(), "lr": args.lr}, {"params": head.parameters(), "lr": args.head_lr}])
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         gen = torch.Generator(device="cpu").manual_seed(args.seed)

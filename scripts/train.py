@@ -15,7 +15,7 @@ from generative.networks.schedulers import DDPMScheduler
 
 from oct_wd import cohort as co
 from oct_wd import wavelet as wv
-from oct_wd.model import build_model, predict
+from oct_wd.model import Z_DOWN, build_model, options, predict, to_device
 from oct_wd.volumes import OctVolumes
 
 
@@ -35,6 +35,9 @@ def parse():
     ap.add_argument("--test-fraction", type=float, default=0.2)
     ap.add_argument("--slo-size", type=int, default=0, help="0 trains without SLO; otherwise the SLO is resized to this size and used as a conditioner")
     ap.add_argument("--slo-drop", type=float, default=0.2, help="share of training steps that see no SLO")
+    ap.add_argument("--slo-adapter", action="store_true", help="also add SLO features, sampled along each B-scan's line on the SLO, to the U-Net encoder at every level, and a pooled SLO vector to the time embedding; needs --slo-size")
+    ap.add_argument("--keep-slices", type=int, default=0, help="keep this many middle B-scans of each scan, 0 for all; 24 of 25 drops the last")
+    ap.add_argument("--z-down", type=int, nargs=4, default=list(Z_DOWN), choices=(0, 1), help="for each of the U-Net's four downsamplings, 1 if it also halves the slice axis")
     ap.add_argument("--band-scale", type=float, nargs="?", const=1.0, default=0.0, help="divide each wavelet band by its root mean square on the training scans raised to this power (1 if given alone, 0.5 for the square root) before noise is added, so fine detail is not buried under the noise; sampling and heads read the divisors from the checkpoint")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-steps", type=int, default=None, help="cap steps per epoch, for smoke tests")
@@ -55,14 +58,13 @@ def git_hash():
 def unpack(batch, device, conditioned):
     if not conditioned:
         return batch.to(device, non_blocking=True), None, None
-    vol, slo = batch[0], batch[1]
-    other = batch[2].to(device) if len(batch) > 2 else None
-    return vol.to(device, non_blocking=True), slo.to(device), other
+    other = to_device(batch[2], device) if len(batch) > 2 else None
+    return batch[0].to(device, non_blocking=True), to_device(batch[1], device), other
 
 
 @torch.no_grad()
 def measure_bands(scans, args, axes, device):
-    loader = torch.utils.data.DataLoader(OctVolumes(scans, args.target), batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+    loader = torch.utils.data.DataLoader(OctVolumes(scans, args.target, keep=args.keep_slices), batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     total, values, n = torch.zeros(wv.channels(axes), dtype=torch.float64, device=device), 0, 0
     for step, vol in enumerate(loader):
         if args.max_steps and step >= args.max_steps:
@@ -109,6 +111,12 @@ def main():
 
     if not 0 <= args.band_scale <= 1:
         raise SystemExit("--band-scale takes a power from 0 to 1")
+    if args.slo_adapter and not conditioned:
+        raise SystemExit("--slo-adapter needs --slo-size")
+    if not 0 <= args.keep_slices <= args.n_slices:
+        raise SystemExit("--keep-slices must be from 0 to --n-slices")
+    if (args.keep_slices or args.n_slices) > args.target[0]:
+        raise SystemExit("--target has %d slices, fewer than the %d B-scans kept" % (args.target[0], args.keep_slices or args.n_slices))
     latest = os.path.join(args.out, "latest.pt")
     resume = args.resume or (args.auto_resume and os.path.exists(latest))
     if os.path.exists(latest) and not resume:
@@ -122,11 +130,19 @@ def main():
         power = ckpt.get("band_power", 0.0 if ckpt.get("band_scale") is None else 1.0)
         if ckpt["design"] != args.design or ckpt.get("slo_size", 0) != args.slo_size or power != args.band_scale:
             raise SystemExit("latest.pt was trained with design %s, SLO size %d, band scaling %s" % (ckpt["design"], ckpt.get("slo_size", 0), "on, power %g" % power if power else "off"))
+        saved = options(ckpt)
+        if (saved["adapter"], saved["keep"], saved["z_down"]) != (args.slo_adapter, args.keep_slices, tuple(args.z_down)):
+            raise SystemExit("latest.pt was trained with SLO adapter %s, slices kept %s, slice-axis halving %s" % ("on" if saved["adapter"] else "off", saved["keep"] or "all", " ".join(map(str, saved["z_down"]))))
 
     axes = wv.DESIGNS[args.design]
     n_ch = wv.channels(axes)
-    grid = wv.check_unet_grid(args.target, axes)
-    print("design %s: %d channels, target %s, wavelet grid %s, SLO %s, device %s" % (args.design, n_ch, tuple(args.target), grid, "%d px" % args.slo_size if conditioned else "not used", device))
+    try:
+        grid = wv.check_unet_grid(args.target, axes, args.z_down)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    print("design %s: %d channels, target %s, wavelet grid %s, SLO %s, device %s" % (args.design, n_ch, tuple(args.target), grid, ("%d px" % args.slo_size + (", adapter" if args.slo_adapter else "")) if conditioned else "not used", device))
+    if args.keep_slices or tuple(args.z_down) != Z_DOWN:
+        print("B-scans kept: %s of %d; slice axis halved at %d of 4 downsamplings (%s)" % (args.keep_slices or "all", args.n_slices, sum(args.z_down), " ".join(map(str, args.z_down))))
     if use_amp:
         print("GPU: %s" % torch.cuda.get_device_name(0))
 
@@ -168,10 +184,11 @@ def main():
             f.write(json.dumps(dict(record, after_epoch=ckpt["epoch"])) + "\n")
 
     loader_args = dict(batch_size=args.batch_size, num_workers=args.workers, pin_memory=use_amp, persistent_workers=args.workers > 0)
-    train_loader = torch.utils.data.DataLoader(OctVolumes(train_scans, args.target, args.slo_size), shuffle=True, drop_last=True, **loader_args)
-    val_loader = torch.utils.data.DataLoader(OctVolumes(val_scans, args.target, args.slo_size, other=conditioned), shuffle=False, **loader_args)
+    data = dict(adapter=args.slo_adapter, keep=args.keep_slices)
+    train_loader = torch.utils.data.DataLoader(OctVolumes(train_scans, args.target, args.slo_size, **data), shuffle=True, drop_last=True, **loader_args)
+    val_loader = torch.utils.data.DataLoader(OctVolumes(val_scans, args.target, args.slo_size, other=conditioned, **data), shuffle=False, **loader_args)
 
-    model = build_model(n_ch, args.slo_size).to(device)
+    model = build_model(n_ch, args.slo_size, args.slo_adapter, tuple(args.z_down)).to(device)
     print("parameters: %d" % sum(p.numel() for p in model.parameters()))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -227,7 +244,7 @@ def main():
         print("epoch %d: train mse %.6f  %s  %.0f s  peak %.2f GiB  steps %d" % (epoch, total / steps, shown, time.time() - started, peak, steps), flush=True)
 
         path = os.path.join(args.out, "epoch_%04d.pt" % epoch)
-        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist(), "band_rms": None if rms is None else rms.tolist(), "band_power": args.band_scale}
+        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist(), "band_rms": None if rms is None else rms.tolist(), "band_power": args.band_scale, "slo_adapter": args.slo_adapter, "keep_slices": args.keep_slices, "z_down": list(args.z_down)}
         torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
         torch.save(state, latest + ".tmp")

@@ -25,10 +25,11 @@ def grid(shape, axes):
     return tuple(s)
 
 
-def check_unet_grid(shape, axes, factor=16):
+def check_unet_grid(shape, axes, z_down=(1, 1, 1, 1)):
     g = grid(shape, axes)
-    if any(d % factor for d in g):
-        raise ValueError("wavelet grid %s must be divisible by %d for this U-Net" % (g, factor))
+    need = (2 ** sum(1 for d in z_down if d), 2 ** len(z_down), 2 ** len(z_down))
+    if any(d % f for d, f in zip(g, need)):
+        raise ValueError("wavelet grid %s must be divisible by %s for this U-Net" % (g, need))
     return g
 
 

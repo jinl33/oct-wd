@@ -318,6 +318,175 @@ def test_models():
     assert ev.better("binary", 0.8, 0.7) and ev.better("regression", 1.0, 2.0) and ev.better("binary", 0.6, float("nan"))
 
 
+def fails(fn, error=ValueError):
+    try:
+        fn()
+    except error as e:
+        return str(e)
+    raise AssertionError("expected %s" % error.__name__)
+
+
+def test_adapter_parts(root):
+    lines = np.array([[10.0 + 10 * k, 20.0, 10.0 + 10 * k, 180.0] for k in range(4)])
+    g = vo.slo_grid(lines, (100, 200), (4, 5, 9), (8, 5, 9))
+
+    def x_of(col):
+        return (col + 0.5) / 200 * 2 - 1
+
+    def y_of(row):
+        return (row + 0.5) / 100 * 2 - 1
+
+    assert g.shape == (3, 8, 9) and g[2].sum() == 4 * 9 and (g[2, 2:6] == 1).all(), g[2]
+    assert np.allclose(g[0, 2, [0, 8]], [x_of(20), x_of(180)]) and np.allclose(g[1, 2:6, 4], [y_of(r) for r in (10, 20, 30, 40)])
+    assert np.allclose(g[1, [0, 1, 6, 7], 0], [y_of(r) for r in (-10, 0, 50, 60)]), "padded slices continue the raster"
+    wide = vo.slo_grid(lines, (100, 200), (4, 5, 9), (4, 5, 13))
+    assert wide[2].sum() == 4 * 9 and (wide[2][:, :2] == 0).all() and (wide[2][:, 11:] == 0).all() and np.isclose(wide[0, 0, 2], x_of(20))
+    fails(lambda: vo.slo_grid(lines[:3], (100, 200), (4, 5, 9), (8, 5, 9)))
+
+    w2 = wv.DESIGNS["w2z1"]
+    assert wv.check_unet_grid((24, 64, 64), w2, (0, 0, 1, 1)) == (12, 16, 16)
+    assert "(16, 16, 16)" in fails(lambda: wv.check_unet_grid((24, 64, 64), w2))
+    fails(lambda: mo.build_model(32, z_down=(0, 1)))
+    fails(lambda: mo.build_model(32, 0, adapter=True))
+
+    flat = mo.build_model(32, z_down=(0, 0, 1, 1)).eval()
+    assert set(flat.state_dict()) == set(mo.build_model(32).state_dict()), "the slice-axis option must keep the weight names"
+    shapes = []
+    hooks = [b.register_forward_hook(lambda m, i, o: shapes.append(tuple(o[0].shape[2:]))) for b in flat.down_blocks]
+    x24 = torch.rand(1, 32, 12, 16, 16) * 2 - 1
+    with torch.no_grad():
+        out = flat(x=x24, timesteps=torch.tensor([10]))
+    for h in hooks:
+        h.remove()
+    with torch.no_grad():
+        f24 = mo.Encoder(flat).eval()(x24, torch.tensor([10]))
+    assert out.shape == x24.shape and f24.shape == (1, 560), (out.shape, f24.shape)
+    assert shapes == [(12, 8, 8), (12, 4, 4), (6, 2, 2), (3, 1, 1), (3, 1, 1)], shapes
+
+    torch.manual_seed(0)
+    a = mo.build_model(32, 64, adapter=True).eval()
+    assert all((p == 0).all() for p in a.adapter.parameters()), "the adapter must start at zero"
+    with torch.no_grad():
+        for name, prm in a.named_parameters():
+            if not name.startswith("adapter.") and (prm == 0).all():
+                prm.normal_(0, 0.02)
+    b = mo.build_model(32, 64).eval()
+    b.load_state_dict({k: v for k, v in a.state_dict().items() if not k.startswith("adapter.")})
+    lines25 = np.array([[3.0 + k, 10.0, 3.0 + k, 70.0] for k in range(25)])
+    grid = torch.from_numpy(vo.slo_grid(lines25, (96, 96), (25, 128, 128), (32, 128, 128)))[None].expand(2, -1, -1, -1)
+    img = torch.rand(2, 64, 64) * 2 - 1
+    x = torch.rand(2, 32, 16, 32, 32) * 2 - 1
+    t = torch.tensor([3, 700])
+    with torch.no_grad():
+        start = a(x, t, (img, grid))
+        ref = b(x, t, img)
+        fa0, fb = mo.Encoder(a).eval()(x, t, (img, grid)), mo.Encoder(b).eval()(x, t, img)
+        assert torch.allclose(a.slo.to_tokens(a.slo.stages(img)[-1]), a.slo(img), atol=1e-6)
+    assert torch.allclose(start, ref, atol=1e-5) and torch.allclose(fa0, fb, atol=1e-5), "a new adapter must start as the plain SLO model"
+    fails(lambda: a(x, t, img))
+
+    with torch.no_grad():
+        for prm in a.adapter.parameters():
+            prm.normal_(0, 0.05)
+        moved_grid = grid.clone()
+        moved_grid[:, 0] += 0.3
+        own = a(x, t, (img, grid))
+        moved = a(x, t, (img, moved_grid))
+        none = a(x, t, None)
+        dropped = a(x, t, (img, grid), torch.tensor([False, False]))
+        half = a(x, t, (img, grid), torch.tensor([True, False]))
+        enc = mo.Encoder(a).eval()
+        fa_own, fa_none = enc(x, t, (img, grid)), enc(x, t, None)
+        fb_own, fb_none = mo.Encoder(b).eval()(x, t, img), mo.Encoder(b).eval()(x, t, None)
+        add = a.adapter(a.slo.stages(img), grid)(0, torch.zeros(2, 40, 16, 32, 32))
+    assert not torch.allclose(own, ref, atol=1e-4) and not torch.allclose(own, moved, atol=1e-4), "the adapter and the scan lines must reach the output"
+    assert torch.allclose(dropped, none, atol=1e-5) and torch.allclose(half[1], none[1], atol=1e-5) and torch.allclose(half[0], own[0], atol=1e-5), "a dropped SLO must give the no-SLO prediction"
+    assert not torch.allclose(fa_own[:, :40], fa_none[:, :40], atol=1e-5), "the adapter must reach the first encoder level"
+    assert torch.allclose(fb_own[:, :160], fb_none[:, :160], atol=1e-6), "cross-attention alone reaches only the deep levels"
+    assert (add[:, :, [0, 14, 15]] == 0).all() and add[:, :, 2:14].abs().sum() > 0, "padded slices must get no SLO features"
+
+    scans, _ = co.list_scans(root, 25)
+    s = scans[0]
+    assert np.array_equal(vo.load_volume(s["folder"], 25, 24), vo.load_volume(s["folder"], 25)[:24])
+    fails(lambda: vo.load_volume(s["folder"], 25, 26))
+    x0, (img0, g0), (other_img, other_grid) = vo.OctVolumes(scans[:3], (32, 64, 64), 64, other=True, adapter=True)[0]
+    assert x0.shape == (1, 32, 64, 64) and img0.shape == (64, 64) and g0.shape == (3, 32, 64)
+    assert torch.equal(g0, other_grid) and not torch.equal(img0, other_img), "the other-SLO test swaps the image, not the scan lines"
+    assert g0[2].sum() == 25 * 64 and (g0[2, 3:28] == 1).all()
+    assert torch.allclose(g0[1, 3:28, 0], torch.tensor([(2 + k + 0.5) / SLO * 2 - 1 for k in range(1, 26)]))
+    assert torch.allclose(g0[0, 3, [0, WIDTH - 1]], torch.tensor([10.5 / SLO * 2 - 1, 70.5 / SLO * 2 - 1]))
+    x24, (_, g24) = vo.OctVolumes(scans[:1], (24, 64, 64), 64, adapter=True, keep=24)[0]
+    assert x24.shape == (1, 24, 64, 64) and g24.shape == (3, 24, 64) and bool(g24[2].all()) and torch.allclose(g24[:2], g0[:2, 3:27])
+    plain = vo.OctVolumes(scans[:2], (32, 64, 64), 64, other=True)[0]
+    assert len(plain) == 3 and plain[1].shape == (64, 64) and plain[2].shape == (64, 64), "the plain SLO model keeps its batch layout"
+
+
+def test_adapter_runs(root, tmp):
+    common = ["--root", root, "--batch-size", "2", "--workers", "0", "--max-steps", "2", "--val-fraction", "0.2", "--test-fraction", "0.2"]
+    ada = os.path.join(tmp, "run_adapter")
+    ada_base = ["scripts/train.py", *common, "--out", ada, "--target", "32", "64", "64", "--slo-size", "64", "--slo-adapter", "--band-scale", "0.5"]
+    code, out = run(*ada_base, "--epochs", "1")
+    assert code == 0 and "SLO 64 px, adapter" in out and "(own SLO)  other SLO" in out and "B-scans kept" not in out, out
+    no_leak(out, "train with the SLO adapter")
+    print(out)
+    ckpt = torch.load(os.path.join(ada, "latest.pt"), map_location="cpu", weights_only=False)
+    assert ckpt["slo_adapter"] is True and ckpt["keep_slices"] == 0 and ckpt["z_down"] == [1, 1, 1, 1]
+    assert any(k.startswith("adapter.") for k in ckpt["model"]) and all(torch.isfinite(v).all() for v in ckpt["model"].values())
+    code, out = run(*ada_base, "--epochs", "2", "--auto-resume")
+    assert code == 0 and "resumed after epoch 1" in out, out
+    code, out = run(*[a for a in ada_base if a != "--slo-adapter"], "--epochs", "3", "--auto-resume")
+    assert code != 0 and "SLO adapter on" in out, out
+    code, out = run("scripts/train.py", *common, "--out", os.path.join(tmp, "run_no_slo"), "--target", "32", "64", "64", "--slo-adapter", "--epochs", "1")
+    assert code != 0 and "--slo-adapter needs --slo-size" in out, out
+    code, out = run("scripts/sample.py", "--run", ada, "--root", root, "--n-samples", "1", "--ddim-steps", "2", "--n-eval", "2")
+    assert code == 0 and "SLO 64 px, adapter" in out and "ratio, own SLO" in out and "from the SLO of real_000" in out, out
+    no_leak(out, "sample with the SLO adapter")
+    for extra in ([], ["--random-init"], ["--mode", "finetune", "--epochs", "1"]):
+        code, out = run("scripts/downstream.py", "--run", ada, "--root", root, "--task", "righteye", "--workers", "0", "--n-boot", "50", *extra)
+        assert code == 0 and "SLO 64 px, adapter" in out and "test auroc" in out, out
+        no_leak(out, "downstream with the SLO adapter")
+    with open(os.path.join(ada, "downstream", "righteye_probe_t0", "results.json")) as f:
+        assert json.load(f)["slo_adapter"] is True
+
+    flat = os.path.join(tmp, "run_24")
+    flat_base = ["scripts/train.py", *common, "--out", flat, "--target", "24", "64", "64", "--keep-slices", "24", "--z-down", "0", "0", "1", "1"]
+    code, out = run(*flat_base, "--epochs", "1")
+    assert code == 0 and "wavelet grid (12, 16, 16)" in out and "B-scans kept: 24 of 25; slice axis halved at 2 of 4 downsamplings (0 0 1 1)" in out, out
+    no_leak(out, "train on 24 slices")
+    print(out)
+    code, out = run(*flat_base[:-4], "0", "1", "1", "1", "--epochs", "2", "--auto-resume")
+    assert code != 0 and "slice-axis halving 0 0 1 1" in out, out
+    code, out = run(*flat_base[:-5], "--out", os.path.join(tmp, "run_24_iso"), "--epochs", "1")
+    assert code != 0 and "must be divisible by (16, 16, 16)" in out, out
+    code, out = run(*flat_base[:-4], "0", "1", "1", "1", "--out", os.path.join(tmp, "run_24_three"), "--epochs", "1")
+    assert code != 0 and "must be divisible by (8, 16, 16)" in out, out
+    code, out = run("scripts/train.py", *common, "--out", flat, "--target", "32", "64", "64", "--epochs", "2", "--auto-resume")
+    assert code != 0 and "slices kept 24" in out, out
+    code, out = run("scripts/train.py", *common, "--out", os.path.join(tmp, "run_short"), "--target", "24", "64", "64", "--z-down", "0", "0", "1", "1", "--epochs", "1")
+    assert code != 0 and "fewer than the 25 B-scans kept" in out, out
+    code, out = run("scripts/sample.py", "--run", flat, "--root", root, "--n-samples", "1", "--ddim-steps", "2", "--n-eval", "2")
+    assert code == 0 and "generated 1 of 1" in out, out
+    with Image.open(os.path.join(flat, "samples", "sample_000.png")) as im:
+        assert im.size == (WIDTH + 24 * 8 + WIDTH + 20, DEPTH), im.size
+    code, out = run("scripts/downstream.py", "--run", flat, "--root", root, "--task", "male", "--workers", "0", "--n-boot", "50")
+    assert code == 0 and "test auroc" in out, out
+
+    both = os.path.join(tmp, "run_adapter_24")
+    code, out = run("scripts/train.py", *common, "--out", both, "--target", "24", "64", "64", "--keep-slices", "24", "--z-down", "0", "0", "1", "1", "--slo-size", "64", "--slo-adapter", "--band-scale", "0.5", "--epochs", "1")
+    assert code == 0 and "SLO 64 px, adapter" in out and "B-scans kept: 24" in out, out
+    no_leak(out, "train with the adapter on 24 slices")
+    code, out = run("scripts/downstream.py", "--run", both, "--root", root, "--task", "righteye", "--mode", "finetune", "--epochs", "1", "--workers", "0", "--n-boot", "50")
+    assert code == 0 and "test auroc" in out, out
+    report = os.path.join(tmp, "report_adapter_24")
+    code, out = run("scripts/scan_report.py", "--run", both, "--root", root, "--out", report, "--max-scans", "2", "--steps", "50", "--group", "--n-worst", "1")
+    assert code == 0 and "SLO 64 px, adapter" in out and "scored 2 scans, could not read 0" in out, out
+    no_leak(out, "scan report with the adapter on 24 slices")
+    with Image.open(os.path.join(report, "worst_000.png")) as im:
+        assert im.size == (3 * WIDTH + 20, DEPTH), im.size
+    code, out = run("scripts/probe_memory.py", "--target", "24", "64", "64", "--steps", "1", "--max-batch", "1", "--designs", "w2z1", "--slo-size", "64", "--slo-adapter", "--z-down", "0", "0", "1", "1")
+    assert code == 0 and "SLO 64 px, adapter" in out and "halved at 2 of 4" in out and "batch  1: OK" in out, out
+
+
 def test_report_measures():
     a = torch.zeros(3, 40, 40, dtype=torch.float64)
     assert abs(ev.psnr(a + 0.1, a) - 10 * np.log10(4 / 0.01)) < 1e-9 and ev.psnr(a, a) == float("inf")
@@ -668,8 +837,10 @@ def main():
             ("SLO alignment measure", test_alignment, ()),
             ("cohort and split", test_cohort, (root,)),
             ("models, encoder and metrics", test_models, ()),
+            ("SLO adapter and slice-axis option", test_adapter_parts, (root,)),
             ("PSNR, SSIM and groups", test_report_measures, ()),
             ("scan report", test_report, (root, tmp)),
+            ("SLO adapter and 24-slice runs", test_adapter_runs, (root, tmp)),
             ("scripts end to end", test_scripts, (root, tmp)),
         ):
             print("--- %s" % name, flush=True)

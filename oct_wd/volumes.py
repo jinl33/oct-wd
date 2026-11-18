@@ -5,10 +5,19 @@ import torch
 from PIL import Image
 from scipy.ndimage import uniform_filter1d
 
+from oct_wd import alignment as al
 
-def load_volume(folder, n):
+
+def first_slice(n, keep=0):
+    if keep < 0 or keep > n:
+        raise ValueError("cannot keep %d of %d B-scans" % (keep, n))
+    return (n - keep) // 2 if keep else 0
+
+
+def load_volume(folder, n, keep=0):
+    start = first_slice(n, keep)
     slices = []
-    for i in range(1, n + 1):
+    for i in range(start + 1, start + (keep or n) + 1):
         with Image.open(os.path.join(folder, "b%d.png" % i)) as im:
             a = np.asarray(im)
         if a.ndim != 2 or a.dtype != np.uint8:
@@ -70,16 +79,66 @@ def load_slo(folder, size):
     return (np.clip((a - low) / (high - low), 0, 1) * 2 - 1).astype(np.float32, copy=False)
 
 
+def slo_grid(lines, slo_shape, native, target):
+    n, width = native[0], native[-1]
+    zt, wt = target[0], target[-1]
+    if n < 2 or len(lines) != n:
+        raise ValueError("need one scan line per B-scan, at least 2")
+    k = np.arange(zt) - (zt - n) // 2
+    j = np.arange(wt) - (wt - width) // 2
+    i = np.clip(k, 0, n - 2)
+    p = lines[i] + (k - i)[:, None] * (lines[i + 1] - lines[i])
+    u = (j / max(width - 1, 1))[None, :]
+    rows = p[:, 0:1] + u * (p[:, 2:3] - p[:, 0:1])
+    cols = p[:, 1:2] + u * (p[:, 3:4] - p[:, 1:2])
+    valid = ((k >= 0) & (k < n))[:, None] & ((j >= 0) & (j < width))[None, :]
+    return np.stack([(cols + 0.5) / slo_shape[1] * 2 - 1, (rows + 0.5) / slo_shape[0] * 2 - 1, valid]).astype(np.float32)
+
+
+def load_slo_grid(folder, n, native, target, keep=0):
+    lines = al.read_lines(folder)
+    if len(lines) != n:
+        raise ValueError("metadata has %d scan lines for %d B-scans" % (len(lines), n))
+    start = first_slice(n, keep)
+    with Image.open(os.path.join(folder, "slo.png")) as im:
+        width, height = im.size
+    return slo_grid(lines[start: start + native[0]], (height, width), native, target)
+
+
+def load_condition(folder, n, slo_size, adapter, native, target, keep=0):
+    if not slo_size:
+        return None
+    slo = torch.from_numpy(load_slo(folder, slo_size))
+    if not adapter:
+        return slo
+    return slo, torch.from_numpy(load_slo_grid(folder, n, native, target, keep))
+
+
+def as_batch(cond):
+    if cond is None:
+        return None
+    if isinstance(cond, (tuple, list)):
+        return tuple(c[None] for c in cond)
+    return cond[None]
+
+
+def with_other_slo(cond, other):
+    image = other[0] if isinstance(other, (tuple, list)) else other
+    return (image, cond[1]) if isinstance(cond, (tuple, list)) else image
+
+
 def other_index(i, n):
     return (i + n // 2) % n
 
 
 class OctVolumes(torch.utils.data.Dataset):
-    def __init__(self, scans, target, slo_size=0, other=False):
+    def __init__(self, scans, target, slo_size=0, other=False, adapter=False, keep=0):
         self.scans = scans
         self.target = tuple(target)
         self.slo_size = slo_size
         self.other = other
+        self.adapter = adapter
+        self.keep = keep
 
     def __len__(self):
         return len(self.scans)
@@ -87,13 +146,15 @@ class OctVolumes(torch.utils.data.Dataset):
     def __getitem__(self, i):
         s = self.scans[i]
         try:
-            x = torch.from_numpy(pad(scale(load_volume(s["folder"], s["n"])), self.target))[None]
+            vol = scale(load_volume(s["folder"], s["n"], self.keep))
+            x = torch.from_numpy(pad(vol, self.target))[None]
             if not self.slo_size:
                 return x
-            item = (x, torch.from_numpy(load_slo(s["folder"], self.slo_size)))
+            cond = load_condition(s["folder"], s["n"], self.slo_size, self.adapter, vol.shape, self.target, self.keep)
+            item = (x, cond)
             if self.other:
                 j = other_index(i, len(self.scans))
-                item += (torch.from_numpy(load_slo(self.scans[j]["folder"], self.slo_size)),)
+                item += (with_other_slo(cond, torch.from_numpy(load_slo(self.scans[j]["folder"], self.slo_size))),)
         except Exception as e:
             raise RuntimeError("volume index %d failed: %s" % (i, type(e).__name__)) from None
         return item

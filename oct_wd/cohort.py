@@ -4,6 +4,13 @@ import os
 import random
 import re
 
+import numpy as np
+
+
+IDENTIFIERS = ("anon_id", "datadir", "seriesdescription")
+NOT_GROUPS = re.compile(r"date|time|mrn|path|dir|name|uid|(^|_)id$", re.I)
+DATE_VALUE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4}")
+
 
 def default_root():
     root = os.environ.get("OCT_ROOT")
@@ -98,3 +105,25 @@ def label(scan, column):
     except ValueError:
         return None
     return value if math.isfinite(value) else None
+
+
+def group_labels(scans, column, max_groups=12, width=16):
+    if column.strip().lower() in IDENTIFIERS or NOT_GROUPS.search(column):
+        raise SystemExit("%s may identify scans or dates, so it cannot be a group" % column)
+    if not scans or column not in scans[0]["row"]:
+        raise SystemExit("the cohort file has no column %s" % column)
+    raw = [(s["row"].get(column) or "").strip() for s in scans]
+    present = sorted({v for v in raw if v})
+    if not present:
+        raise SystemExit("column %s is empty" % column)
+    if any(DATE_VALUE.search(v) for v in present):
+        raise SystemExit("column %s holds dates, so it cannot be a group" % column)
+    if len(present) <= max_groups and len(present) <= max(2, len(raw) // 2):
+        return [v[:width] or None for v in raw], sorted({v[:width] for v in present})
+    values = [label(s, column) if v else None for s, v in zip(scans, raw)]
+    if any(v and x is None for v, x in zip(raw, values)):
+        raise SystemExit("column %s has %d different values and not all are numbers, so it cannot be a group" % (column, len(present)))
+    edges = np.unique(np.quantile([x for x in values if x is not None], [0, 0.25, 0.5, 0.75, 1]))
+    names = ["%.3g to %.3g" % (lo, hi) for lo, hi in zip(edges[:-1], edges[1:])]
+    out = [None if x is None else names[min(max(int(np.searchsorted(edges, x, side="right")) - 1, 0), len(names) - 1)] for x in values]
+    return out, names

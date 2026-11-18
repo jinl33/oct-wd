@@ -1,4 +1,8 @@
+import math
+
 import numpy as np
+import torch
+import torch.nn.functional as F
 from scipy.stats import rankdata
 
 MAIN = {"binary": "auroc", "regression": "mae"}
@@ -41,3 +45,22 @@ def bootstrap(kind, y, pred, n=1000, seed=0):
     if not values:
         return float("nan"), float("nan")
     return float(np.percentile(values, 2.5)), float(np.percentile(values, 97.5))
+
+
+def psnr(a, b, data_range=2.0):
+    mse = (a.double() - b.double()).pow(2).mean().item()
+    return float("inf") if mse == 0 else 10 * math.log10(data_range ** 2 / mse)
+
+
+def ssim(a, b, data_range=2.0, size=11, sigma=1.5):
+    a, b = a.double()[:, None], b.double()[:, None]
+    g = torch.exp(-((torch.arange(size, dtype=torch.float64, device=a.device) - size // 2) ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    k = (g[:, None] * g[None, :])[None, None]
+    mu_a, mu_b = F.conv2d(a, k), F.conv2d(b, k)
+    var_a = F.conv2d(a * a, k) - mu_a ** 2
+    var_b = F.conv2d(b * b, k) - mu_b ** 2
+    cov = F.conv2d(a * b, k) - mu_a * mu_b
+    c1, c2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    s = (2 * mu_a * mu_b + c1) * (2 * cov + c2) / ((mu_a ** 2 + mu_b ** 2 + c1) * (var_a + var_b + c2))
+    return s.mean().item()

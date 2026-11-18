@@ -117,6 +117,22 @@ On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs
 
    It works if the coarse row of the band table stays near 1, the fine rows land between `w2z1` and `w2z1_band` (ideally near 1), black share and median brightness come back towards real, and the eye probe at 37 to 93 labels is close to `w2z1`'s. Its loss is in its own units, so it cannot be compared with either run.
 
+   Done 2026-11-12. It meets these checks on the numbers (Results, "Milder band scaling"); the images are still to be viewed.
+
+   The same scaling on `w1z1` (`w1z1_sqrt`, started 2026-11-13, batch 2 × accum 2 as for `w1z1`), run one job at a time:
+
+       bash jobs/lab_run.sh w1z1_sqrt scripts/train.py --out /data/oct_data/oct-runs/w1z1_sqrt --design w1z1 --batch-size 2 --accum 2 --epochs 200 --auto-resume --band-scale 0.5
+       bash jobs/lab_run.sh eval_w1sqrt jobs/lab_evaluate.sh /data/oct_data/oct-runs/w1z1_sqrt
+       bash jobs/lab_run.sh frac_w1sqrt jobs/lab_label_fraction.sh /data/oct_data/oct-runs/w1z1_sqrt
+
+   Done 2026-11-18. Texture comes back, but the eye probe falls below `w1z1` at every label count and below `w2z1_sqrt` with few labels (Results, "Milder band scaling on `w1z1`").
+
+7. Scan report (asked for 2026-11-17, for Lubomir): cohort counts and reconstruction quality per scan, as plots. Each validation and test scan is noised to steps 50, 200 and 500 and restored in one model call. PSNR and SSIM compare the restored scan with the original; SSIM is computed per B-scan and averaged. The noisy input's PSNR shows how hard each step is. The plots group scans by `male` and `righteye` for now; once the data pull adds age or a diagnosis, pass that column with `--group`. Plots need matplotlib (`pip install matplotlib` in `oct-env`); without it, the numbers and the table are still written.
+
+       bash jobs/lab_run.sh report_w2sqrt scripts/scan_report.py --run /data/oct_data/oct-runs/w2z1_sqrt
+
+   Output goes to `RUN/scan_report`: `cohort.png`, `reconstruction.png`, one `reconstruction_COLUMN.png` per group, `scans.csv` (one row per scan, no IDs) and `worst_*.png` (noisy input, restored and original middle B-scan of the lowest-PSNR scans). View the images on the VM. Noise is added in each run's own wavelet units, so compare groups within a run, not runs with each other. PSNR is the error on a log scale, 10·log10(4 / MSE) on the -1 to 1 scale. Generated scans have no real counterpart, so PSNR does not apply to them.
+
 `male` and `righteye` are the only labels the pilot has. They check that the heads run end to end. They are not research results.
 
 ### Reading the logs
@@ -174,6 +190,14 @@ Validation diffusion loss. Compare rows of the same design only.
 - **Band sizes measured on the 372 training scans:** root mean square 0.8245, 0.0592, 0.0291, 0.0228, 0.0191 and 0.0178 for 0 to 5 detail axes. The smallest single band is 0.0118. The four validation scans in the band table are smoother: 0.0103 to 0.0186 for 2 to 5 axes.
 - **Validation loss, in band-scaled units:** 0.788 at epoch 1, then 0.573, 0.544, 0.532 and 0.526 at epochs 50, 100, 150 and 200. Predicting zero would give about 1. This cannot be compared with the table above.
 
+`w2z1` with `--band-scale 0.5` (2026-11-12, `w2z1_sqrt`, batch 4, 42 to 44 s per epoch, peak 9.30 GiB):
+- **Band sizes:** the same as `w2z1_band` (same split), now divided by their square roots.
+- **Validation loss, in its own units:** 0.0318 at epoch 1, then 0.0201, 0.0197, 0.0195 and 0.0193 at epochs 50, 100, 150 and 200. Predicting zero would give at most about 0.055. Not comparable with `w2z1` or `w2z1_band`.
+
+`w1z1` with `--band-scale 0.5` (2026-11-13, `w1z1_sqrt`, batch 2 × accum 2, 125 s per epoch, peak 20.08 GiB, as for `w1z1`):
+- **Band sizes measured on the 372 training scans:** root mean square 0.8276, 0.0839, 0.0451 and 0.0297 for 0 to 3 detail axes, divided by their square roots.
+- **Validation loss, in its own units:** 0.0788 at epoch 1, then 0.0333, 0.0324, 0.0320 and 0.0319 at epochs 50, 100, 150 and 200 (lowest 0.0318 at epoch 196). Predicting zero would give about 0.16. Not comparable with any other run.
+
 Heads on the 106 test scans: AUROC with 95% CI.
 
 | Encoder | Task | Probe, pretrained | Probe, random init | Finetune, pretrained | Finetune, random init |
@@ -186,8 +210,16 @@ Heads on the 106 test scans: AUROC with 95% CI.
 | `w1z1` | male | 0.532 | 0.506 | 0.548 | 0.543 |
 | `w2z1_band` | right eye | 0.748 | 0.518 | 0.961 | 0.970 |
 | `w2z1_band` | male | 0.546 | 0.433 | 0.474 | 0.481 |
+| `w2z1_sqrt` | right eye | 0.821 (0.728–0.900) | 0.404 (0.299–0.516) | 0.988 (0.959–1.000) | 0.980 (0.946–0.999) |
+| `w2z1_sqrt` | male | 0.440 (0.327–0.550) | 0.455 (0.339–0.577) | 0.581 (0.476–0.689) | 0.602 (0.490–0.712) |
+| `w1z1_sqrt` | right eye | 0.841 (0.754–0.910) | 0.610 (0.506–0.713) | 0.988 (0.968–1.000) | 0.983 (0.962–0.996) |
+| `w1z1_sqrt` | male | 0.525 (0.409–0.632) | 0.559 (0.435–0.669) | 0.555 (0.450–0.668) | 0.593 (0.482–0.696) |
 
-The `w1z1` and `w2z1_band` rows come from the summary table, which has no CIs; they are in each `results.json`. The `w2z1_band` random-init control sees band-scaled input, so its random-init numbers are not comparable with the other rows.
+The `w1z1` and `w2z1_band` rows come from the summary table, which has no CIs; they are in each `results.json`. The random-init controls of `w2z1_band`, `w2z1_sqrt` and `w1z1_sqrt` see band-scaled input, so their random-init numbers are not comparable with the other rows.
+
+`w2z1_sqrt` eye finetune curves (2026-11-12, one seed): from pretrained weights, validation AUROC 0.94 at epoch 3 and 0.996 at epoch 5; from random init, 0.61 at epoch 5, 0.95 at epoch 9 and 0.98 at epoch 11. Pretraining speeds up finetuning here as it does for `w2z1`.
+
+`w1z1_sqrt` eye finetune curves (2026-11-18, one seed): from pretrained weights, validation AUROC stays between 0.45 and 0.61 for 8 epochs, then 0.81 at epoch 9, 0.94 at epoch 10 and 0.99 at epoch 11; from random init, 0.92 at epoch 12, 0.96 at epoch 15 and 0.99 at epoch 16. Pretraining is about 5 epochs ahead, but starts later than for `w2z1_sqrt`. The curve for plain `w1z1` was not recorded.
 
 Sampling (denoising on 20 validation scans; 4 generated scans):
 - **Denoising ratio, `w2z1`:** 0.256, 0.291, 0.365, 0.615 and 0.980 at noise steps 50, 200, 500, 800 and 950.
@@ -209,14 +241,14 @@ What this shows:
   - **Epoch choice by validation AUROC is noise for tasks near chance.** For sex, validation AUROC jumps between 0.39 and 0.71 from epoch to epoch on 53 scans.
 - **Generated scans lack fine texture,** as in the first baseline. The band table (4 generated scans per run, 2026-11-10) shows where:
 
-  | Detail axes | Real size (`w2z1`) | Generated / real: `w2z1` | SLO model | `w1z1` | `w2z1_band` |
-  |---|---|---|---|---|---|
-  | 0 (coarse image) | 0.863 | 1.013 | 1.028 | 1.016 | 0.749 |
-  | 1 | 0.048 | 0.799 | 0.840 | 0.770 | 1.191 |
-  | 2 | 0.019 | 0.204 | 0.189 | 0.136 | 2.268 |
-  | 3 | 0.014 | 0.046 | 0.042 | 0.044 | 2.515 |
-  | 4 | 0.011 | 0.018 | 0.014 | none | 2.567 |
-  | 5 | 0.010 | 0.013 | 0.011 | none | 2.239 |
+  | Detail axes | Real size (`w2z1`) | Generated / real: `w2z1` | SLO model | `w1z1` | `w2z1_band` | `w2z1_sqrt` | `w1z1_sqrt` |
+  |---|---|---|---|---|---|---|---|
+  | 0 (coarse image) | 0.863 | 1.013 | 1.028 | 1.016 | 0.749 | 0.955 | 1.027 |
+  | 1 | 0.048 | 0.799 | 0.840 | 0.770 | 1.191 | 1.366 | 1.138 |
+  | 2 | 0.019 | 0.204 | 0.189 | 0.136 | 2.268 | 1.979 | 0.930 |
+  | 3 | 0.014 | 0.046 | 0.042 | 0.044 | 2.515 | 1.942 | 0.770 |
+  | 4 | 0.011 | 0.018 | 0.014 | none | 2.567 | 1.723 | none |
+  | 5 | 0.010 | 0.013 | 0.011 | none | 2.239 | 1.253 | none |
 
   Coarse content and one-axis detail are reproduced; bands with three or more detail axes, mostly speckle and fine texture, come out at 1 to 5% of their real size. The real fine bands (0.010 to 0.019; 0.017 to 0.027 in `w1z1`) are about the size of the noise added at the last step (0.010) and well below that at step 10 (0.047). This fits the idea that the scaling in `wavelet.forward` hides fine detail under the noise for all but the last few steps and leaves it almost no weight in the loss.
 - **Label fractions** (eye probe, 2026-11-10). Heads trained on part of the training scans, five random subsets per fraction; validation and test stay whole. Test AUROC, mean (min to max):
@@ -272,7 +304,64 @@ What this shows:
   - **Finetuning and sex are not informative here.** Eye finetune: 0.961 pretrained and 0.970 random init, one seed each. Sex is at chance everywhere (0.43 to 0.55).
   - **The denoising ratio of 1.05 at step 950 is expected,** not a fault: the "average scan" is the mean of the same 20 scans, which gives it a head start of 1/(1 − 1/20) = 1.053 over a model that has learned the average of all scans.
   - **What this says.** Full-strength band scaling trades the coarse anatomy for speckle. The eye is a coarse cue, so this task favours `w2z1`; whether texture helps a diagnosis task is still open. `w2z1` stays the main model for now.
+- **Milder band scaling** (`w2z1_sqrt`, `--band-scale 0.5`, evaluated 2026-11-12; generated images not yet viewed). Same 4 validation scans in the band table as the other runs.
+  - **Coarse image kept, texture back at about the right size.** Generated / real is 0.955 for the coarse band and 1.25 to 1.98 for 1 to 5 detail axes. Against the band sizes measured on the 372 training scans, which are larger than those of the 4 comparison scans, the fine bands come out at 0.73 to 1.27 times.
+  - **Intensity:**
+
+    | | Real | `w2z1` | `w2z1_band` | `w2z1_sqrt` |
+    |---|---|---|---|---|
+    | Mean | -0.665 | | -0.267 | -0.579 |
+    | Median | -0.908 | | -0.355 | -0.827 |
+    | 99th percentile | 1.000 | | 1.000 | 0.886 |
+    | Black share | 0.346 | 0.258 | 0.081 | 0.176 |
+    | Within-slice change | 0.084 | 0.003 | 0.142 | 0.110 |
+    | Slice-to-slice change | 0.123 | about 0.03 | 0.192 | 0.172 |
+
+    Brightness is close to real. The lower black share is expected once there is texture: real background is clipped to exactly -1, and any fine detail on top of it lifts about half of those pixels above the -0.99 cut-off (inferred). The brightest parts are a little dimmer than real. Generated scans change somewhat more between neighbouring pixels and slices than these 4 scans, which are smoother than the average training scan.
+  - **The denoising ratio of 1.04 at step 950** is the same head start for the in-sample average as for `w2z1_band`; its other ratios are in this run's own units and are not compared.
+  - Eye probe at label fractions, pretrained, test AUROC mean (min to max) over five subsets:
+
+  | Training scans with labels | `w2z1` | `w2z1_band` | `w2z1_sqrt` |
+  |---|---|---|---|
+  | 37 (10%) | 0.760 (0.701–0.807) | 0.542 (0.454–0.616) | 0.745 (0.665–0.843) |
+  | 93 (25%) | 0.808 (0.785–0.831) | 0.556 (0.514–0.612) | 0.805 (0.773–0.824) |
+  | 186 (50%) | 0.840 (0.798–0.870) | 0.630 (0.598–0.657) | 0.816 (0.804–0.843) |
+  | 372 (100%) | 0.845 | 0.748 | 0.821 |
+
+  - The milder scaling keeps the frozen features about as useful as `w2z1`'s: level with it at 37 and 93 labels, about 0.02 lower from 186 up, inside the spread over subsets.
+  - Its random-init probe is at chance (0.40 to 0.50) and sees band-scaled input, so it is not compared across runs.
+  - **What this says.** Square-root scaling keeps the coarse image and the probe of `w2z1` and brings fine detail to about its real size. It is the main candidate for the `w2z1` design, pending a look at the images on the VM (layer order and shape, background). The default of `--band-scale` stays off until the lab agrees.
 - The evaluation ran beside `w1z1` without trouble; the GPU showed 24.6 GB in use before it started. With the SLO, the encoder has 10,287,288 parameters.
+- **Milder band scaling on `w1z1`** (`w1z1_sqrt`, `--band-scale 0.5`, typed back 2026-11-18; generated images not yet viewed). Same 4 validation scans in the band table as the other runs.
+  - **Texture is back, the finest detail still short.** Generated / real is 1.027 for the coarse band and 1.138, 0.930 and 0.770 for 1, 2 and 3 detail axes (`w1z1`: 0.770, 0.136 and 0.044). Against the band sizes measured on the 372 training scans, the 1 to 3 axis bands come out at 0.86, 0.56 and 0.43 times (`w2z1_sqrt`: 0.73 to 1.27).
+  - **Intensity:**
+
+    | | Real | `w1z1` | `w1z1_sqrt` |
+    |---|---|---|---|
+    | Mean | -0.665 | -0.678 | -0.681 |
+    | Median | -0.908 | -0.953 | -0.983 |
+    | 99th percentile | 1.000 | 0.840 | 0.906 |
+    | Black share | 0.346 | 0.164 | 0.461 |
+    | Within-slice change | 0.084 | 0.006 | 0.052 |
+    | Slice-to-slice change | 0.123 | 0.046 | 0.097 |
+
+    Mean brightness is close to real. Black share moves the other way from `w2z1_sqrt` (0.176): these 4 generated scans have more pure background than real ones, and a darker median. Whether that is a thinner or shifted retina, or chance in 4 scans, needs the images (not known).
+  - **Denoising ratio:** 0.201, 0.554, 0.764, 0.858 and 0.947 at steps 50, 200, 500, 800 and 950, in this run's own units; not compared.
+  - Eye probe at label fractions, test AUROC mean (min to max) over five subsets. A subset is the same patients in every run (same split and seeds in `label_subset`):
+
+  | Training scans with labels | `w1z1` pretrained | `w1z1_sqrt` pretrained | `w1z1_sqrt` random init | `w2z1_sqrt` pretrained |
+  |---|---|---|---|---|
+  | 37 (10%) | 0.801 (0.740–0.830) | 0.660 (0.631–0.717) | 0.502 (0.423–0.571) | 0.745 (0.665–0.843) |
+  | 93 (25%) | 0.849 (0.794–0.878) | 0.754 (0.745–0.770) | 0.587 (0.523–0.655) | 0.805 (0.773–0.824) |
+  | 186 (50%) | 0.868 (0.810–0.901) | 0.805 (0.781–0.828) | 0.591 (0.567–0.611) | 0.816 (0.804–0.843) |
+  | 372 (100%) | 0.891 | 0.841 | 0.610 | 0.821 |
+
+  - **The frozen features got worse for the eye.** `w1z1_sqrt` is below `w1z1` at every label count, by 0.05 (all labels) to 0.14 (37 labels). At 37 labels it is lower on each of the 5 subsets, by 0.10 to 0.19, and the ranges do not overlap at 37 or 93 labels. On `w2z1` the same scaling cost 0.00 to 0.02.
+  - **Against `w2z1_sqrt`,** it is lower with 37 and 93 labels (0.66 and 0.75 against 0.75 and 0.81) and level from 186 up.
+  - Its random-init probe (0.50 to 0.61) sees band-scaled input, so it is not compared across runs. Pretraining adds 0.16 to 0.23 over it.
+  - **Finetuning and sex:** eye finetune 0.988 pretrained and 0.983 random init, one seed each. Sex is at chance everywhere (0.52 to 0.59).
+  - **One pretraining run per design.** The fixed subsets rule out which patients carry labels as the cause, but how far a second pretraining seed would move these numbers is not measured.
+  - **What this says.** On `w1z1`, square-root scaling brings texture back (within-slice change 0.006 to 0.052) but costs the eye probe most where labels are few, and the finest bands stay short of the training-scan sizes. `w2z1_sqrt` keeps its probe, has fine detail at least as close to real, and costs 9.3 GB and 44 s per epoch against 20 GB and 125 s. It stays the main candidate; `w1z1_sqrt` does not earn its cost on this evidence. The eye is a coarse cue, so a diagnosis task could still rank them differently.
 
 ## Full pull from Peter (plan from 2026-11-09)
 
@@ -293,7 +382,7 @@ What the pipeline then needs:
 - Matthias and Hayagreev count 498 pilot scans; the folders give 531 with 25 B-scans.
 - Which downstream tasks come first, and how controls are defined.
 - `w1z1` against `w2z1`: compare on the heads and the generated-scan numbers once `w1z1` is evaluated, not on loss or denoising ratio.
-- Generated scans lack texture: measured on 2026-11-10 (band table under Results). If the lost detail is mostly speckle, the features may still serve classification, but small lesions also live at fine scales. Fix tried 2026-11-11: `--band-scale` (run plan step 5). As feared, the coarse image, which held about 95% of the coefficient power on the training scans, got worse once it became 1 of 32 equal bands; fine detail overshoots and the eye probe dropped (Results, "Band scaling"). Next try: `--band-scale 0.5` (run plan step 6), dividing each band by the square root of its size, so the coarse band keeps about half of the power. The `w2z1_band` images still need a look on the VM.
+- Generated scans lack texture: measured on 2026-11-10 (band table under Results). If the lost detail is mostly speckle, the features may still serve classification, but small lesions also live at fine scales. Fix tried 2026-11-11: `--band-scale` (run plan step 5). As feared, the coarse image, which held about 95% of the coefficient power on the training scans, got worse once it became 1 of 32 equal bands; fine detail overshoots and the eye probe dropped (Results, "Band scaling"). `--band-scale 0.5` (run plan step 6, 2026-11-12) keeps the coarse image and the eye probe and brings fine detail to about its real size (Results, "Milder band scaling"). The same scaling on `w1z1` (`w1z1_sqrt`, 2026-11-13) brings texture back but lowers the eye probe by 0.05 to 0.14 (Results, "Milder band scaling on `w1z1`"). Still to do: view the `w2z1_sqrt`, `w2z1_band` and `w1z1_sqrt` images on the VM, and decide with the lab whether `w2z1_sqrt` replaces `w2z1` as the main model.
 - A stronger SLO test than the loss: correlate each generated scan's en-face image with its own SLO and with another scan's, using the same measure as the QC (real scans: 0.197 own vs 0.000 other).
 - **Does `anon_id` identify a person?** In the pilot each `anon_id` has exactly one scan: the label-fraction runs report 372 training "patients" for 372 training scans. If one person's two eyes, or two visits, carry different `anon_id`s, they can fall on both sides of the split. That cannot leak the eye label, but it would leak person-level labels such as sex or a diagnosis. Ask Hayagreev whether a person-level ID exists for the pilot. For the full pull, the agreed pseudo-ID must be per person. Bootstrap CIs should then resample persons.
 - Label fractions on the eye task are done for `w2z1` (probe and finetune) and `w1z1` (probe). Pretrained finetuning scored lower than random init on test at 10% and 25%, but validation disagrees on at least one subset. The training loss rules out early memorisation by the head. The eye task is too easy and the evaluation sets too small to settle this. Repeat the fractions on a diagnosis task once one is chosen.

@@ -318,6 +318,100 @@ def test_models():
     assert ev.better("binary", 0.8, 0.7) and ev.better("regression", 1.0, 2.0) and ev.better("binary", 0.6, float("nan"))
 
 
+def test_report_measures():
+    a = torch.zeros(3, 40, 40, dtype=torch.float64)
+    assert abs(ev.psnr(a + 0.1, a) - 10 * np.log10(4 / 0.01)) < 1e-9 and ev.psnr(a, a) == float("inf")
+    x = torch.rand(3, 40, 40) * 2 - 1
+    y = (x + 0.3 * torch.randn(3, 40, 40)).clamp(-1, 1)
+    s = ev.ssim(x, y)
+    assert abs(ev.ssim(x, x) - 1) < 1e-12 and 0 < s < 1, s
+    try:
+        from skimage.metrics import structural_similarity
+    except ImportError:
+        print("  (scikit-image not installed: SSIM comparison skipped)")
+    else:
+        ref = np.mean([structural_similarity(x[k].double().numpy(), y[k].double().numpy(), data_range=2.0, gaussian_weights=True, sigma=1.5, use_sample_covariance=False) for k in range(3)])
+        assert abs(ref - s) < 1e-9, (ref, s)
+    scans = [{"row": {"male": ["True", "False"][k % 2], "age": str(20 + k), "gaze": "", "anon_id": "P%d" % k, "visit_date": "x", "when": "2021-01-0%d" % (k % 3 + 1), "eye": "LR"[k % 2] if k else ""}} for k in range(20)]
+    values, names = co.group_labels(scans, "male")
+    assert names == ["False", "True"] and values[:2] == ["True", "False"], (values, names)
+    values, names = co.group_labels(scans, "age")
+    assert names == ["20 to 24.8", "24.8 to 29.5", "29.5 to 34.2", "34.2 to 39"] and values[0] == names[0] and values[-1] == names[-1], names
+    assert [values.count(n) for n in names] == [5, 5, 5, 5], values
+    values, names = co.group_labels(scans, "eye")
+    assert values[0] is None and names == ["L", "R"]
+    for bad in ("anon_id", "visit_date", "when", "gaze", "not_there"):
+        try:
+            co.group_labels(scans, bad)
+        except SystemExit as e:
+            assert "P1" not in str(e) and "2021" not in str(e), e
+            continue
+        raise AssertionError("%s should be refused as a group" % bad)
+
+
+def test_report(root, tmp):
+    plain, cond = os.path.join(tmp, "report_plain"), os.path.join(tmp, "report_slo_band")
+    train = ["scripts/train.py", "--root", root, "--target", "32", "64", "64", "--batch-size", "2", "--workers", "0", "--max-steps", "2", "--val-fraction", "0.2", "--test-fraction", "0.2", "--epochs", "1"]
+    code, out = run(*train, "--out", plain)
+    assert code == 0, out
+    code, out = run(*train, "--out", cond, "--slo-size", "64", "--band-scale", "0.5")
+    assert code == 0, out
+    with open(os.path.join(plain, "split.json")) as f:
+        split = json.load(f)
+    scans, _ = co.list_scans(root, 25)
+    held = [s for s in scans if s["patient"] in set(split["val"]) | set(split["test"])]
+    trained = [s for s in scans if s["patient"] in set(split["train"])]
+
+    report = os.path.join(tmp, "report_out")
+    args = ["scripts/scan_report.py", "--run", plain, "--root", root, "--steps", "500", "50", "--group", "male", "righteye", "age", "--n-worst", "2", "--out", report]
+    code, out = run(*args)
+    assert code == 0, out
+    no_leak(out, "scan_report")
+    assert "checkpoint epoch 1, design w2z1, SLO not used, band scaling off" in out, out
+    assert "scored %d scans, could not read 0" % len(held) in out and "scored here: %d from val and test" % len(held) in out, out
+    assert "male, scans per value (train / val / test):" in out and "by righteye:" in out and "by age:" in out and "  50     PSNR p " in out, out
+    assert "lowest PSNR at step 500" in out and "2 worst_*.png" in out, out
+    with open(os.path.join(report, "scans.csv")) as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == len(held) and {r["part"] for r in rows} <= {"val", "test"}, rows
+    assert list(rows[0]) == ["part", "male", "righteye", "age", "psnr_t50", "noisy_psnr_t50", "ssim_t50", "psnr_t500", "noisy_psnr_t500", "ssim_t500"], list(rows[0])
+    for r in rows:
+        assert all(np.isfinite(float(r[k])) for k in r if "_t" in k), r
+        assert -1 <= float(r["ssim_t50"]) <= 1 and float(r["noisy_psnr_t50"]) > float(r["noisy_psnr_t500"]), r
+    with open(os.path.join(report, "scans.csv")) as f:
+        text = f.read()
+    no_leak(text, "scans.csv")
+    made = sorted(os.listdir(report))
+    try:
+        import matplotlib
+        plots = ["cohort.png", "reconstruction.png", "reconstruction_age.png", "reconstruction_male.png", "reconstruction_righteye.png"]
+    except ImportError:
+        plots = []
+    assert made == sorted(plots + ["scans.csv", "worst_000.png", "worst_001.png"]), made
+    with Image.open(os.path.join(report, "worst_000.png")) as im:
+        assert im.size == (3 * WIDTH + 20, DEPTH), im.size
+    print(out)
+
+    code, again = run(*args[:-1], report + "_again")
+    with open(os.path.join(report + "_again", "scans.csv")) as f:
+        assert code == 0 and f.read() == text, "a second report must give the same numbers"
+
+    code, out = run("scripts/scan_report.py", "--run", plain, "--root", root, "--parts", "train", "--steps", "100", "--group", "--n-worst", "0", "--out", report + "_train")
+    assert code == 0 and "scored %d scans" % len(trained) in out and "by " not in out and "lowest PSNR" not in out, out
+    no_leak(out, "scan_report on training scans")
+
+    code, out = run("scripts/scan_report.py", "--run", cond, "--root", root, "--steps", "200", "--max-scans", "2", "--out", report + "_cond")
+    assert code == 0 and "SLO 64 px, band scaling on" in out and "scored 2 scans" in out, out
+    no_leak(out, "scan_report with SLO and band scaling")
+    print(out)
+
+    for extra, want in ((["--group", "anon_id"], "cannot be a group"), (["--group", "seriesDescription"], "cannot be a group"),
+                        (["--group", "datadir"], "cannot be a group"), (["--steps", "0"], "between 1 and 999")):
+        code, out = run("scripts/scan_report.py", "--run", plain, "--root", root, "--out", report + "_bad", *extra)
+        assert code != 0 and want in out, out
+        no_leak(out, "scan_report refusal")
+
+
 def test_scripts(root, tmp):
     code, out = run("scripts/check_cohort.py", "--root", root)
     assert code == 0, out
@@ -574,6 +668,8 @@ def main():
             ("SLO alignment measure", test_alignment, ()),
             ("cohort and split", test_cohort, (root,)),
             ("models, encoder and metrics", test_models, ()),
+            ("PSNR, SSIM and groups", test_report_measures, ()),
+            ("scan report", test_report, (root, tmp)),
             ("scripts end to end", test_scripts, (root, tmp)),
         ):
             print("--- %s" % name, flush=True)

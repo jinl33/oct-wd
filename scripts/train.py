@@ -40,6 +40,7 @@ def parse():
     ap.add_argument("--z-down", type=int, nargs=4, default=list(Z_DOWN), choices=(0, 1), help="for each of the U-Net's four downsamplings, 1 if it also halves the slice axis")
     ap.add_argument("--band-scale", type=float, nargs="?", const=1.0, default=0.0, help="divide each wavelet band by its root mean square on the training scans raised to this power (1 if given alone, 0.5 for the square root) before noise is added, so fine detail is not buried under the noise; sampling and heads read the divisors from the checkpoint")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--split-seed", type=int, default=None, help="seed of the train, validation and test split; defaults to --seed, so a run with a new --seed and --split-seed 42 keeps the split of earlier runs")
     ap.add_argument("--max-steps", type=int, default=None, help="cap steps per epoch, for smoke tests")
     ap.add_argument("--keep", type=int, default=3, help="number of recent checkpoints to keep")
     ap.add_argument("--resume", action="store_true", help="continue from latest.pt in --out")
@@ -148,7 +149,7 @@ def main():
 
     scans, counts = co.list_scans(args.root or co.default_root(), args.n_slices)
     print("cohort:", counts)
-    train_scans, val_scans, test_scans = co.split_by_patient(scans, args.val_fraction, args.test_fraction, args.seed)
+    train_scans, val_scans, test_scans = co.split_by_patient(scans, args.val_fraction, args.test_fraction, args.seed if args.split_seed is None else args.split_seed)
     groups = [set(s["patient"] for s in part) for part in (train_scans, val_scans, test_scans)]
     if groups[0] & groups[1] or groups[0] & groups[2] or groups[1] & groups[2]:
         raise SystemExit("patient overlap between train, validation and test")

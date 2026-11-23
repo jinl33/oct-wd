@@ -496,8 +496,8 @@ def test_report_measures():
     assert abs(ev.ssim(x, x) - 1) < 1e-12 and 0 < s < 1, s
     try:
         from skimage.metrics import structural_similarity
-    except ImportError:
-        print("  (scikit-image not installed: SSIM comparison skipped)")
+    except (ImportError, ValueError):
+        print("  (scikit-image not installed or broken: SSIM comparison skipped)")
     else:
         ref = np.mean([structural_similarity(x[k].double().numpy(), y[k].double().numpy(), data_range=2.0, gaussian_weights=True, sigma=1.5, use_sample_covariance=False) for k in range(3)])
         assert abs(ref - s) < 1e-9, (ref, s)
@@ -820,6 +820,139 @@ def test_scripts(root, tmp):
     no_leak(out, "train with a broken file")
 
 
+def test_slo_parts(root):
+    x = torch.rand(2, 32, 16, 32, 32) * 2 - 1
+    t = torch.tensor([3, 700])
+    slo = torch.rand(2, 64, 64) * 2 - 1
+    base = mo.build_model(32, 64).eval()
+    with torch.no_grad():
+        for prm in base.parameters():
+            if (prm == 0).all():
+                prm.normal_(0, 0.02)
+    wide = mo.build_model(32, 64, xattn=(0, 1, 2)).eval()
+    loaded = wide.load_state_dict(base.state_dict(), strict=False)
+    assert not loaded.unexpected_keys and loaded.missing_keys and all(k.startswith("xattn.") for k in loaded.missing_keys), loaded
+    with torch.no_grad():
+        start = mo.predict(base, x, t, slo)
+        assert start.abs().mean() > 1e-3 and torch.allclose(start, mo.predict(wide, x, t, slo), atol=1e-5), "zero-initialised cross-attention must start as the SLO model without it"
+        for name, prm in wide.xattn.named_parameters():
+            if ".norm." not in name:
+                prm.normal_(0, 0.5)
+        own, swapped = mo.predict(wide, x, t, slo), mo.predict(wide, x, t, slo.flip(0))
+        enc = mo.Encoder(wide, slo_features=True).eval()
+        feats = enc(x, t, slo)
+        feats_swapped = enc(x, t, slo.flip(0))
+    assert not torch.allclose(own, swapped), "the added cross-attention must carry the SLO"
+    assert enc.xattn is wide.xattn and feats.shape == (2, 560 + 160) == (2, enc.dim), feats.shape
+    assert not torch.allclose(feats[:, :560], feats_swapped[:, :560]) and not torch.allclose(feats[:, 560:], feats_swapped[:, 560:])
+    big = mo.build_model(32, 64, tokens=16, dim=96)
+    assert big.slo(slo).shape == (2, 256, 96)
+    assert fails(lambda: mo.build_model(32, 0, xattn=(1,))).startswith("the SLO adapter and SLO cross-attention need")
+    assert fails(lambda: mo.build_model(32, 64, xattn=(5,))).startswith("--slo-xattn levels run from 0 to 4")
+    assert mo.options({})["xattn"] == () and mo.options({})["tokens"] == 8 and mo.options({})["slo_slice"] is None
+
+    h = torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1, 1)
+    assert mo.pool(h, ((0, 12), (12, 13)), 16).tolist() == [[1.0, 3.0]]
+    assert mo.pool(torch.arange(16, dtype=torch.float32).view(1, 1, 16, 1, 1), ((0, 12), (12, 13)), 16).tolist() == [[5.5, 12.0]]
+    axes = wv.DESIGNS["w2z1"]
+    assert mo.joint_parts({"keep_slices": 24, "slo_slice": "raster"}, axes) == ((0, 12), (12, 13))
+    assert mo.joint_parts({"keep_slices": 24}, axes) is None
+    plain = mo.build_model(32).eval()
+    with torch.no_grad():
+        split = mo.Encoder(plain, zparts=((0, 12), (12, 13))).eval()(x, t)
+    assert split.shape == (2, 1120), split.shape
+
+    folder = sorted(glob.glob(os.path.join(root, "oct_images", "*FAKEUID3")))[0]
+    vol, full = vo.assemble(folder, 25, (32, 64, 64), keep=24, slo_slice="raster")
+    assert vol.shape == (24, DEPTH, WIDTH) and full.shape == (32, 64, 64) and full.dtype == np.float32
+    assert np.array_equal(vo.oct_region(full, vol.shape, True), vol) and np.array_equal(full[24], full[25]) and (full[26:] == -1).all()
+    assert np.array_equal(vo.slo_region(full, vol.shape), full[24]) and full[24].min() >= -1 and full[24].max() <= 1
+    c = wv.forward(torch.from_numpy(full)[None, None], axes)
+    alone = wv.forward(torch.from_numpy(full[24:26].copy())[None, None], axes)
+    assert torch.allclose(c[:, :, 12:13], alone, atol=1e-6), "the SLO must sit in its own wavelet slice"
+    lines = al.read_lines(folder)[:24]
+    rows, cols = vo.raster_positions(lines, 64, 64)
+    for k in (0, 11, 23):
+        r = vo.raster_row(k, 24, 64)
+        assert abs(rows[r, 0] - lines[k, 0]) <= 0.5 and abs(cols[r, 0] - lines[k, 1]) < 1e-6 and abs(cols[r, -1] - lines[k, 3]) < 1e-6
+    whole = vo.load_slo_slice(folder, 25, (64, 64), 24, "full")
+    assert whole.shape == (64, 64) and not np.array_equal(whole, full[24])
+    _, centred = vo.assemble(folder, 25, (32, 64, 64), keep=24)
+    assert np.array_equal(vo.oct_region(centred, vol.shape, False), vol)
+    assert fails(lambda: vo.joint_volume(np.zeros((25, DEPTH, WIDTH), np.float32), full[24], (32, 64, 64))).startswith("the joint volume needs")
+    assert fails(lambda: vo.joint_volume(np.zeros((24, DEPTH, WIDTH), np.float32), full[24], (24, 64, 64))).startswith("the joint volume needs")
+
+
+def test_slo_runs(root, tmp):
+    common = ["--root", root, "--batch-size", "2", "--workers", "0", "--max-steps", "2", "--val-fraction", "0.2", "--test-fraction", "0.2"]
+    wide = os.path.join(tmp, "run_xattn")
+    wide_base = ["scripts/train.py", *common, "--out", wide, "--target", "24", "64", "64", "--keep-slices", "24", "--z-down", "0", "0", "1", "1", "--slo-size", "64", "--slo-tokens", "4", "--slo-dim", "96", "--slo-xattn", "2", "0", "1", "--band-scale", "0.5"]
+    code, out = run(*wide_base, "--epochs", "1")
+    assert code == 0 and "SLO 64 px, 16 tokens of 96, cross-attention at levels 0 1 2" in out and "(own SLO)  other SLO" in out, out
+    no_leak(out, "train with SLO cross-attention")
+    print(out)
+    ckpt = torch.load(os.path.join(wide, "latest.pt"), map_location="cpu", weights_only=False)
+    assert ckpt["slo_xattn"] == [0, 1, 2] and ckpt["slo_tokens"] == 4 and ckpt["slo_dim"] == 96 and ckpt["slo_slice"] is None
+    assert any(k.startswith("xattn.0.") for k in ckpt["model"]) and all(torch.isfinite(v).all() for v in ckpt["model"].values())
+    code, out = run(*wide_base, "--epochs", "2", "--auto-resume")
+    assert code == 0 and "resumed after epoch 1" in out, out
+    code, out = run(*wide_base[:-5], "1", "--band-scale", "0.5", "--epochs", "3", "--auto-resume")
+    assert code != 0 and "cross-attention levels 0 1 2" in out, out
+    code, out = run("scripts/train.py", *common, "--out", os.path.join(tmp, "run_xattn_no_slo"), "--target", "32", "64", "64", "--slo-xattn", "1", "--epochs", "1")
+    assert code != 0 and "--slo-xattn needs --slo-size" in out, out
+    code, out = run("scripts/sample.py", "--run", wide, "--root", root, "--n-samples", "1", "--ddim-steps", "2", "--n-eval", "2")
+    assert code == 0 and "cross-attention at levels 0 1 2" in out and "ratio, own SLO" in out, out
+    no_leak(out, "sample with SLO cross-attention")
+    for extra in ([], ["--slo-features"], ["--slo-features", "--random-init"], ["--slo-features", "--mode", "finetune", "--epochs", "1"]):
+        code, out = run("scripts/downstream.py", "--run", wide, "--root", root, "--task", "righteye", "--workers", "0", "--n-boot", "50", *extra)
+        size = 720 if "--slo-features" in extra else 560
+        assert code == 0 and "cross-attention at levels 0 1 2" in out and "feature size %d" % size in out and "test auroc" in out, out
+        no_leak(out, "downstream with SLO cross-attention")
+    assert os.path.exists(os.path.join(wide, "downstream", "righteye_probe_slofeat_t0", "results.json"))
+    code, out = run("scripts/downstream.py", "--run", wide, "--root", root, "--task", "age", "--kind", "regression", "--slo-features", "--workers", "0", "--n-boot", "50")
+    assert code == 0 and "test mae" in out, out
+    report = os.path.join(tmp, "report_xattn")
+    code, out = run("scripts/scan_report.py", "--run", wide, "--root", root, "--out", report, "--max-scans", "2", "--steps", "50", "--group", "--n-worst", "1")
+    assert code == 0 and "scored 2 scans, could not read 0" in out, out
+    code, out = run("scripts/probe_memory.py", "--target", "24", "64", "64", "--steps", "1", "--max-batch", "1", "--designs", "w2z1", "--slo-size", "64", "--slo-tokens", "4", "--slo-xattn", "0", "1", "2", "--z-down", "0", "0", "1", "1")
+    assert code == 0 and "16 tokens of 160, cross-attention at levels 0 1 2" in out and "batch  1: OK" in out, out
+
+    joint = os.path.join(tmp, "run_joint")
+    joint_base = ["scripts/train.py", *common, "--out", joint, "--target", "32", "64", "64", "--keep-slices", "24", "--z-down", "0", "0", "1", "1", "--slo-slice", "raster", "--band-scale", "0.5"]
+    code, out = run(*joint_base, "--epochs", "1")
+    assert code == 0 and "SLO joint, own slice after the B-scans (raster)" in out and "wavelet grid (16, 16, 16)" in out and "OCT with own SLO slice" in out and "with another scan's" in out, out
+    no_leak(out, "train the joint model")
+    print(out)
+    ckpt = torch.load(os.path.join(joint, "latest.pt"), map_location="cpu", weights_only=False)
+    assert ckpt["slo_slice"] == "raster" and ckpt["slo_size"] == 0 and not any(k.startswith("slo.") for k in ckpt["model"])
+    code, out = run(*[a for a in joint_base if a not in ("--slo-slice", "raster")], "--epochs", "2", "--auto-resume")
+    assert code != 0 and "SLO slice raster" in out, out
+    code, out = run(*joint_base[:-2], "--slo-size", "64", "--out", os.path.join(tmp, "run_joint_slo"), "--epochs", "1")
+    assert code != 0 and "leave out --slo-size" in out, out
+    code, out = run("scripts/train.py", *common, "--out", os.path.join(tmp, "run_joint_odd"), "--target", "32", "64", "64", "--slo-slice", "raster", "--epochs", "1")
+    assert code != 0 and "even number of B-scans" in out, out
+    code, out = run("scripts/train.py", *common, "--out", os.path.join(tmp, "run_joint_full"), "--target", "24", "64", "64", "--keep-slices", "24", "--z-down", "0", "0", "1", "1", "--slo-slice", "full", "--epochs", "1")
+    assert code != 0 and "two free slices" in out, out
+    code, out = run("scripts/sample.py", "--run", joint, "--root", root, "--n-samples", "2", "--ddim-steps", "2", "--n-eval", "2")
+    assert code == 0 and "joint slice (raster)" in out and "SLO slice, intensity" in out and "OCT en-face view against the SLO" in out and "images written: 8" in out, out
+    no_leak(out, "sample from the joint model")
+    print(out)
+    with Image.open(os.path.join(joint, "samples", "sample_000_slo.png")) as im:
+        assert im.size == (64, 64), im.size
+    with Image.open(os.path.join(joint, "samples", "sample_000.png")) as im:
+        assert im.size == (WIDTH + 24 * 8 + WIDTH + 20, DEPTH), im.size
+    for extra, size in (([], 1120), (["--joint-pool", "oct"], 560), (["--joint-pool", "slo", "--random-init"], 560), (["--mode", "finetune", "--epochs", "1"], 1120)):
+        code, out = run("scripts/downstream.py", "--run", joint, "--root", root, "--task", "male", "--workers", "0", "--n-boot", "50", *extra)
+        assert code == 0 and "joint slice (raster)" in out and "feature size %d" % size in out and "test auroc" in out, out
+        no_leak(out, "downstream on the joint model")
+    code, out = run("scripts/downstream.py", "--run", joint, "--root", root, "--task", "male", "--slo-features", "--workers", "0")
+    assert code != 0 and "--slo-features needs a model with an SLO encoder" in out, out
+    report = os.path.join(tmp, "report_joint")
+    code, out = run("scripts/scan_report.py", "--run", joint, "--root", root, "--out", report, "--max-scans", "2", "--steps", "50", "--group", "--n-worst", "1")
+    assert code == 0 and "PSNR and SSIM on the B-scans only" in out and "scored 2 scans, could not read 0" in out, out
+    no_leak(out, "scan report on the joint model")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="oct_wd_test_")
     root = os.path.join(tmp, "OCT-AI")
@@ -841,6 +974,8 @@ def main():
             ("PSNR, SSIM and groups", test_report_measures, ()),
             ("scan report", test_report, (root, tmp)),
             ("SLO adapter and 24-slice runs", test_adapter_runs, (root, tmp)),
+            ("SLO cross-attention levels and joint OCT+SLO volume", test_slo_parts, (root,)),
+            ("SLO cross-attention and joint model runs", test_slo_runs, (root, tmp)),
             ("scripts end to end", test_scripts, (root, tmp)),
         ):
             print("--- %s" % name, flush=True)

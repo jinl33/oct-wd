@@ -14,19 +14,14 @@ from generative.networks.schedulers import DDIMScheduler
 from oct_wd import alignment as al
 from oct_wd import cohort as co
 from oct_wd import wavelet as wv
-from oct_wd.model import band_scale, load_checkpoint, options, predict, to_device
-from oct_wd.volumes import as_batch, load_condition, load_volume, other_index, pad, scale, with_other_slo
+from oct_wd.model import band_scale, joint_parts, load_checkpoint, options, predict, to_device
+from oct_wd.volumes import as_batch, assemble, load_condition, load_volume, oct_region, other_index, raster_row, scale, slo_region, with_other_slo
 
 EVAL_STEPS = (50, 200, 500, 800, 950)
 
 
 def to_uint8(x):
     return ((np.clip(x, -1, 1) + 1) / 2 * 255).astype(np.uint8)
-
-
-def unpad(x, native):
-    start = [(t - s) // 2 for s, t in zip(native, x.shape)]
-    return x[tuple(slice(b, b + s) for b, s in zip(start, native))]
 
 
 def stretch(a):
@@ -72,6 +67,19 @@ def band_table(real, made, n_axes, alphas):
     print("  noise added at step 0, 10, 50: %s" % ", ".join("%.3f" % (1 - alphas[t]).sqrt().item() for t in (0, 10, 50)))
 
 
+def pair_score(vol, slo):
+    v = to_uint8(vol).astype(np.float32)
+    rows = [raster_row(k, v.shape[0], slo.shape[0]) for k in range(v.shape[0])]
+    return al.corr(al.highpass(al.en_face(v)), al.highpass(slo[rows].astype(np.float32)))
+
+
+def correspondence(label, vols, slos):
+    n = len(vols)
+    own = [pair_score(vols[i], slos[i]) for i in range(n)]
+    other = [pair_score(vols[i], slos[other_index(i, n)]) for i in range(n)] if n > 1 else [float("nan")]
+    print("  %-10s own SLO %.3f (min %.3f, max %.3f)   another scan's SLO %.3f" % (label, np.mean(own), np.min(own), np.max(own), np.mean(other)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
@@ -95,7 +103,13 @@ def main():
     slo_size = ckpt.get("slo_size", 0)
     band = band_scale(ckpt)
     model.eval()
-    print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], ("%d px" % slo_size + (", adapter" if saved["adapter"] else "")) if slo_size else "not used", "on" if band is not None else "off", device))
+    joint = joint_parts(ckpt, axes)
+    slo_text = "not used"
+    if slo_size:
+        slo_text = "%d px" % slo_size + (", adapter" if saved["adapter"] else "") + (", cross-attention at levels %s" % " ".join(map(str, saved["xattn"])) if saved["xattn"] else "")
+    elif joint:
+        slo_text = "joint slice (%s)" % saved["slo_slice"]
+    print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], slo_text, "on" if band is not None else "off", device))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
     val = [s for s in scans if s["patient"] in val_patients]
@@ -104,12 +118,15 @@ def main():
     out = os.path.join(args.run, "samples")
     os.makedirs(out, exist_ok=True)
 
-    real, clean, slos = [], [], []
+    real, clean, slos, real_slo = [], [], [], []
     chosen = val[: max(args.n_eval, args.n_samples)]
     for s in chosen:
         vol = load_volume(s["folder"], s["n"], saved["keep"])
         real.append(vol)
-        clean.append(wv.scaled(wv.forward(torch.from_numpy(pad(scale(vol), target))[None, None], axes), band))
+        _, full = assemble(s["folder"], s["n"], target, saved["keep"], saved["slo_slice"])
+        if joint:
+            real_slo.append(slo_region(full, vol.shape))
+        clean.append(wv.scaled(wv.forward(torch.from_numpy(full)[None, None], axes), band))
         if slo_size:
             slos.append(as_batch(load_condition(s["folder"], s["n"], slo_size, saved["adapter"], vol.shape, target, saved["keep"])))
     n_samples = min(args.n_samples, len(chosen))
@@ -137,7 +154,7 @@ def main():
             print("  %-8d %-14.6f %s" % (t_value, avg_err / len(clean), "   ".join("%-14.3f" % (e / max(avg_err, 1e-12)) for e in errs)), flush=True)
 
         ddim.set_timesteps(args.ddim_steps, device=device)
-        made, made_coefs = [], []
+        made, made_coefs, made_slo = [], [], []
         for i in range(n_samples):
             x = torch.randn((1, wv.channels(axes)) + grid, generator=gen).to(device)
             for t_value in ddim.timesteps:
@@ -148,17 +165,29 @@ def main():
                 x = wv.scaled(x, band)
             made_coefs.append(wv.unscaled(x, band).cpu())
             pixels = wv.inverse(made_coefs[-1], axes)[0, 0].clamp(-1, 1).numpy()
-            made.append(unpad(pixels, native))
+            made.append(oct_region(pixels, native, joint is not None))
             save_view(to_uint8(made[-1]), os.path.join(out, "sample_%03d.png" % i))
+            if joint:
+                made_slo.append(slo_region(pixels, native))
+                Image.fromarray(to_uint8(made_slo[-1])).save(os.path.join(out, "sample_%03d_slo.png" % i))
             print("generated %d of %d%s" % (i + 1, n_samples, " from the SLO of real_%03d" % i if slo_size else ""), flush=True)
 
     for i, vol in enumerate(real[:n_samples]):
         save_view(vol, os.path.join(out, "real_%03d.png" % i))
+        if joint:
+            Image.fromarray(to_uint8(real_slo[i])).save(os.path.join(out, "real_%03d_slo.png" % i))
     print("intensity on the -1 to 1 scale:")
     describe("real", [scale(v) for v in real[:n_samples]])
     describe("generated", made)
-    band_table([wv.unscaled(c, band) for c in clean[:n_samples]], made_coefs, len(axes), ddim.alphas_cumprod.cpu())
-    print("images written:", 2 * len(made))
+    lo, hi = joint[0] if joint else (0, None)
+    band_table([wv.unscaled(c, band)[:, :, lo:hi] for c in clean[:n_samples]], [c[:, :, lo:hi] for c in made_coefs], len(axes), ddim.alphas_cumprod.cpu())
+    if joint:
+        print("SLO slice, intensity: real mean %.3f std %.3f   generated mean %.3f std %.3f" % (
+            np.mean([a.mean() for a in real_slo[:n_samples]]), np.mean([a.std() for a in real_slo[:n_samples]]), np.mean([a.mean() for a in made_slo]), np.mean([a.std() for a in made_slo])))
+        print("OCT en-face view against the SLO along the scan lines (correlation after high-pass, as in the alignment check):")
+        correspondence("real", [scale(v) for v in real[:n_samples]], real_slo[:n_samples])
+        correspondence("generated", made, made_slo)
+    print("images written:", (4 if joint else 2) * len(made))
 
 
 try:

@@ -16,7 +16,7 @@ from generative.networks.schedulers import DDPMScheduler
 from oct_wd import cohort as co
 from oct_wd import evaluate as ev
 from oct_wd import wavelet as wv
-from oct_wd.model import Encoder, band_scale, build_model, load_checkpoint, options, to_device
+from oct_wd.model import Encoder, band_scale, build_model, joint_parts, load_checkpoint, model_args, options, to_device
 from oct_wd.volumes import OctVolumes
 
 WEIGHT_DECAYS = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
@@ -40,6 +40,8 @@ def parse():
     ap.add_argument("--n-boot", type=int, default=1000)
     ap.add_argument("--label-fraction", type=float, default=1.0, help="share of training patients whose labels the head sees; finetune epochs scale up so the number of training steps stays about the same")
     ap.add_argument("--subset-seed", type=int, default=0, help="which random subset of training patients, when --label-fraction is below 1")
+    ap.add_argument("--slo-features", action="store_true", help="SLO models: also give the head the SLO encoder's pooled features, so both modalities reach it")
+    ap.add_argument("--joint-pool", default="both", choices=("both", "oct", "slo"), help="joint models (SLO slice): pool the OCT and SLO parts separately and use both, or one of them")
     ap.add_argument("--out", default=None)
     return ap.parse_args()
 
@@ -152,15 +154,21 @@ def main():
     target, slo_size, band, saved = tuple(ckpt["target"]), ckpt.get("slo_size", 0), band_scale(ckpt), options(ckpt)
     if args.random_init:
         torch.manual_seed(args.seed)
-        model = build_model(wv.channels(axes), slo_size, saved["adapter"], saved["z_down"]).to(device)
-    enc = Encoder(model).to(device)
+        model = build_model(wv.channels(axes), **model_args(ckpt)).to(device)
+    zparts = joint_parts(ckpt, axes)
+    if zparts is not None and args.joint_pool != "both":
+        zparts = zparts[:1] if args.joint_pool == "oct" else zparts[1:]
+    if args.slo_features and not slo_size:
+        raise SystemExit("--slo-features needs a model with an SLO encoder")
+    enc = Encoder(model, args.slo_features, zparts).to(device)
     del model
-    name = "%s_%s%s_t%d%s" % (args.task, args.mode, "_random" if args.random_init else "", args.t, "_f%g_s%d" % (args.label_fraction, args.subset_seed) if args.label_fraction < 1 else "")
+    extra = ("_slofeat" if args.slo_features else "") + ("_pool%s" % args.joint_pool if zparts is not None and args.joint_pool != "both" else "")
+    name = "%s_%s%s%s_t%d%s" % (args.task, args.mode, "_random" if args.random_init else "", extra, args.t, "_f%g_s%d" % (args.label_fraction, args.subset_seed) if args.label_fraction < 1 else "")
     out_dir = args.out or os.path.join(args.run, "downstream", name)
     os.makedirs(out_dir, exist_ok=True)
     print("task %s (%s), %s, encoder %s, design %s, SLO %s, band scaling %s, noise step %d, feature size %d, device %s" % (
         args.task, args.kind, args.mode, "random init" if args.random_init else "pretrained epoch %d" % ckpt["epoch"],
-        ckpt["design"], ("%d px" % slo_size + (", adapter" if saved["adapter"] else "")) if slo_size else "not used", "on" if band is not None else "off", args.t, enc.dim, device))
+        ckpt["design"], ("%d px" % slo_size + (", adapter" if saved["adapter"] else "") + (", cross-attention at levels %s" % " ".join(map(str, saved["xattn"])) if saved["xattn"] else "") + (", SLO features to the head" if args.slo_features else "")) if slo_size else ("joint slice (%s), pooled: %s" % (saved["slo_slice"], args.joint_pool) if saved["slo_slice"] else "not used"), "on" if band is not None else "off", args.t, enc.dim, device))
     print("encoder parameters: %d (decoder removed)" % sum(p.numel() for p in enc.parameters()))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
@@ -187,10 +195,10 @@ def main():
 
     sched = DDPMScheduler(num_train_timesteps=1000, schedule="linear_beta", prediction_type="sample")
     started = time.time()
-    result = dict(vars(args), checkpoint_epoch=ckpt["epoch"], design=ckpt["design"], slo_size=slo_size, band_scale=band is not None, slo_adapter=saved["adapter"], keep_slices=saved["keep"], z_down=list(saved["z_down"]), splits=report)
+    result = dict(vars(args), checkpoint_epoch=ckpt["epoch"], design=ckpt["design"], slo_size=slo_size, band_scale=band is not None, slo_adapter=saved["adapter"], keep_slices=saved["keep"], z_down=list(saved["z_down"]), slo_xattn=list(saved["xattn"]), slo_tokens=saved["tokens"], slo_slice=saved["slo_slice"], splits=report)
 
     def volumes(scans):
-        return OctVolumes(scans, target, slo_size, adapter=saved["adapter"], keep=saved["keep"])
+        return OctVolumes(scans, target, slo_size, adapter=saved["adapter"], keep=saved["keep"], slo_slice=saved["slo_slice"])
 
     if args.mode == "probe":
         feats = {p: features(enc, volumes(parts[p]), args, axes, slo_size, sched, device, use_amp, band) for p in parts}

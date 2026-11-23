@@ -9,7 +9,7 @@ import torch
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from oct_wd import wavelet as wv
-from oct_wd.model import Z_DOWN, build_model, predict
+from oct_wd.model import CONTEXT_DIM, Z_DOWN, build_model, predict
 from oct_wd.volumes import slo_grid
 
 ap = argparse.ArgumentParser()
@@ -19,10 +19,13 @@ ap.add_argument("--max-batch", type=int, default=32)
 ap.add_argument("--designs", nargs="+", default=["w2z1", "w1z1"], choices=sorted(wv.DESIGNS))
 ap.add_argument("--slo-size", type=int, default=0)
 ap.add_argument("--slo-adapter", action="store_true")
+ap.add_argument("--slo-tokens", type=int, default=8)
+ap.add_argument("--slo-dim", type=int, default=CONTEXT_DIM)
+ap.add_argument("--slo-xattn", type=int, nargs="*", default=[])
 ap.add_argument("--z-down", type=int, nargs=4, default=list(Z_DOWN), choices=(0, 1))
 args = ap.parse_args()
-if args.slo_adapter and not args.slo_size:
-    raise SystemExit("--slo-adapter needs --slo-size")
+if (args.slo_adapter or args.slo_xattn) and not args.slo_size:
+    raise SystemExit("--slo-adapter and --slo-xattn need --slo-size")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 use_amp = device == "cuda"
@@ -36,14 +39,14 @@ for design in args.designs:
     axes = wv.DESIGNS[design]
     ch = wv.channels(axes)
     g = wv.check_unet_grid(args.target, axes, args.z_down)
-    print("%s: %d channels, wavelet grid %s, SLO %s, slice axis halved at %d of 4 downsamplings" % (design, ch, g, ("%d px" % args.slo_size + (", adapter" if args.slo_adapter else "")) if args.slo_size else "not used", sum(args.z_down)))
+    print("%s: %d channels, wavelet grid %s, SLO %s, slice axis halved at %d of 4 downsamplings" % (design, ch, g, ("%d px" % args.slo_size + (", %d tokens of %d" % (args.slo_tokens ** 2, args.slo_dim) if (args.slo_tokens, args.slo_dim) != (8, CONTEXT_DIM) else "") + (", adapter" if args.slo_adapter else "") + (", cross-attention at levels %s" % " ".join(map(str, args.slo_xattn)) if args.slo_xattn else "")) if args.slo_size else "not used", sum(args.z_down)))
     for bs in (b for b in batches if b <= args.max_batch):
         model = opt = scaler = x = slo = pred = loss = None
         try:
             if use_amp:
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
-            model = build_model(ch, args.slo_size, args.slo_adapter, tuple(args.z_down)).to(device)
+            model = build_model(ch, args.slo_size, args.slo_adapter, tuple(args.z_down), args.slo_tokens, args.slo_dim, sorted(set(args.slo_xattn))).to(device)
             opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
             scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
             x = wv.forward(torch.rand(bs, 1, *args.target, device=device) * 2 - 1, axes)

@@ -3,7 +3,7 @@ import os
 import numpy as np
 import torch
 from PIL import Image
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import map_coordinates, uniform_filter1d
 
 from oct_wd import alignment as al
 
@@ -105,6 +105,63 @@ def load_slo_grid(folder, n, native, target, keep=0):
     return slo_grid(lines[start: start + native[0]], (height, width), native, target)
 
 
+def raster_positions(lines, rows, cols):
+    k = np.linspace(0, len(lines) - 1, rows)
+    i = np.clip(np.floor(k).astype(int), 0, len(lines) - 2)
+    p = lines[i] + (k - i)[:, None] * (lines[i + 1] - lines[i])
+    u = np.linspace(0, 1, cols)[None, :]
+    return p[:, 0:1] + u * (p[:, 2:3] - p[:, 0:1]), p[:, 1:2] + u * (p[:, 3:4] - p[:, 1:2])
+
+
+def raster_row(k, n, rows):
+    return int(round(k * (rows - 1) / max(n - 1, 1)))
+
+
+def load_slo_slice(folder, n, shape, keep=0, region="raster"):
+    with Image.open(os.path.join(folder, "slo.png")) as im:
+        im = im.convert("L")
+        if region == "full":
+            return scale(np.asarray(im.resize((shape[1], shape[0]), Image.BILINEAR), dtype=np.float32))
+        a = np.asarray(im, dtype=np.float32)
+    if region != "raster":
+        raise ValueError("unknown SLO slice region %s" % region)
+    lines = al.read_lines(folder)
+    if len(lines) != n:
+        raise ValueError("metadata has %d scan lines for %d B-scans" % (len(lines), n))
+    start = first_slice(n, keep)
+    rows, cols = raster_positions(lines[start: start + (keep or n)], shape[0], shape[1])
+    return scale(map_coordinates(a, [rows, cols], order=1, mode="nearest"))
+
+
+def joint_volume(vol, slo, target):
+    z = vol.shape[0]
+    if z % 2 or z + 2 > target[0]:
+        raise ValueError("the joint volume needs an even number of B-scans and two free slices for the SLO")
+    out = np.full(tuple(target), -1.0, dtype=np.float32)
+    out[:z] = pad(vol, (z,) + tuple(target[1:]))
+    out[z: z + 2] = slo
+    return out
+
+
+def oct_region(x, native, joint):
+    if not joint:
+        start = [(t - s) // 2 for s, t in zip(native, x.shape)]
+    else:
+        start = [0] + [(t - s) // 2 for s, t in zip(native[1:], x.shape[1:])]
+    return x[tuple(slice(b, b + s) for b, s in zip(start, native))]
+
+
+def slo_region(x, native):
+    return x[native[0]]
+
+
+def assemble(folder, n, target, keep=0, slo_slice=None):
+    vol = scale(load_volume(folder, n, keep))
+    if not slo_slice:
+        return vol, pad(vol, target)
+    return vol, joint_volume(vol, load_slo_slice(folder, n, target[1:], keep, slo_slice), target)
+
+
 def load_condition(folder, n, slo_size, adapter, native, target, keep=0):
     if not slo_size:
         return None
@@ -132,13 +189,14 @@ def other_index(i, n):
 
 
 class OctVolumes(torch.utils.data.Dataset):
-    def __init__(self, scans, target, slo_size=0, other=False, adapter=False, keep=0):
+    def __init__(self, scans, target, slo_size=0, other=False, adapter=False, keep=0, slo_slice=None):
         self.scans = scans
         self.target = tuple(target)
         self.slo_size = slo_size
         self.other = other
         self.adapter = adapter
         self.keep = keep
+        self.slo_slice = slo_slice
 
     def __len__(self):
         return len(self.scans)
@@ -146,8 +204,8 @@ class OctVolumes(torch.utils.data.Dataset):
     def __getitem__(self, i):
         s = self.scans[i]
         try:
-            vol = scale(load_volume(s["folder"], s["n"], self.keep))
-            x = torch.from_numpy(pad(vol, self.target))[None]
+            vol, x = assemble(s["folder"], s["n"], self.target, self.keep, self.slo_slice)
+            x = torch.from_numpy(x)[None]
             if not self.slo_size:
                 return x
             cond = load_condition(s["folder"], s["n"], self.slo_size, self.adapter, vol.shape, self.target, self.keep)

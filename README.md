@@ -40,10 +40,26 @@ Lab computer, in the background with a log in `~/oct-logs`:
 | `bash jobs/lab_run.sh NAME jobs/lab_evaluate.sh RUN [RUN ...]` | For each finished run, one after another: sampling, then probe and finetune heads, pretrained and random init. `TASKS`, `MODES`, `SAMPLE_ARGS`, `DOWN_ARGS` | Yes |
 | `bash jobs/lab_run.sh NAME jobs/lab_label_fraction.sh RUN [RUN ...]` | Heads trained on part of the training patients' labels (`--label-fraction`), several random subsets each, pretrained and random init; ends with a summary table. `TASKS` (default righteye), `MODES` (default probe), `FRACTIONS` (default 0.1 0.25 0.5 1), `SEEDS` (default 0 to 4), `DOWN_ARGS` | Yes |
 | `bash jobs/lab_run.sh NAME jobs/lab_next_runs.sh RUNS_FOLDER` | One after another: memory probe and 200-epoch training for `w2z1_adapter` (SLO adapter, band scaling 0.5), then for `w2z1_sqrt24` (24 slices, slice axis halved twice). A failed step does not stop the next. `EPOCHS` | Yes |
+| `bash jobs/lab_run.sh NAME jobs/lab_slo_runs.sh RUNS_FOLDER` | One after another: memory probe and 200-epoch training for `w2z1_xattn` (SLO with 256 tokens and extra cross-attention at levels 0 to 2), then for `w2z1_joint` (SLO as its own slice after the B-scans). Both on 24 slices with band scaling 0.5. `SLO_RUNS` (default `xattn joint`), `EPOCHS` | Yes |
 | `bash jobs/lab_run.sh NAME scripts/scan_report.py --run RUN` | Each validation and test scan noised to steps 50, 200 and 500 and restored in one model call: PSNR, SSIM and the noisy input's PSNR, split by cohort columns (`--group`, default `male righteye`). Writes plots, a per-scan table without IDs, and views of the lowest-PSNR scans to `RUN/scan_report` | Yes |
 | `python scripts/summarize_downstream.py --run RUN [RUN ...]` | One table of every head result in a run: mean, min and max over subsets | No, reads `results.json` only |
 
 QC images and checkpoints stay on Armis2. Printed logs hold counts and losses only, but read them before sharing.
+
+## New data, start to finish
+On a lab computer, from the repo folder, with `OCT_ROOT` in `~/.oct_paths` pointing at the new image tree and cohort file:
+
+1. `bash jobs/lab_run.sh cohort scripts/check_cohort.py`: counts, slice numbering and scan-line rows. Fix anything it reports first.
+2. `bash jobs/lab_run.sh probe scripts/probe_memory.py --designs w2z1 --target 24 512 512 --z-down 0 0 1 1 --max-batch 8`: the largest batch that fits (add the SLO flags of step 3 when they are used).
+3. Pretrain, 200 epochs (the current best setup; run plan in `docs/HANDOVER.md`):
+
+       bash jobs/lab_run.sh pretrain scripts/train.py --out RUNS/w2z1_sqrt24 --design w2z1 --band-scale 0.5 --batch-size 4 --epochs 200 --auto-resume --keep-slices 24 --target 24 512 512 --z-down 0 0 1 1
+
+   Add `--slo-size 256 --slo-tokens 16 --slo-xattn 0 1 2` for the SLO model, or `--slo-slice raster --target 32 512 512` for the joint model. Restart the same command after a stop.
+4. `bash jobs/lab_run.sh eval jobs/lab_evaluate.sh RUNS/w2z1_sqrt24`: generated samples and their numbers, then probe and finetune heads for each task in `TASKS`, pretrained and from random init.
+5. Heads for a new label: any cohort column, `--task COLUMN` with `--kind binary` (0/1) or `--kind regression` (for example age). `jobs/lab_label_fraction.sh` repeats them on 10 to 100% of the labels.
+
+Distillation is not part of this pipeline yet: the heads use the pretrained encoder directly (see Open items in `docs/HANDOVER.md`).
 
 ## Wavelet designs
 | Name | Levels within B-scan / across slices | Channels | Grid for 32 x 512 x 512 |

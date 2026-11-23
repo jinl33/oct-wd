@@ -18,20 +18,15 @@ from generative.networks.schedulers import DDIMScheduler
 from oct_wd import cohort as co
 from oct_wd import evaluate as ev
 from oct_wd import wavelet as wv
-from oct_wd.model import band_scale, load_checkpoint, options, predict, to_device
-from oct_wd.volumes import as_batch, load_condition, load_volume, pad, scale
+from oct_wd.model import band_scale, joint_parts, load_checkpoint, options, predict, to_device
+from oct_wd.volumes import as_batch, assemble, load_condition, oct_region
 
 PARTS = ("train", "val", "test")
 METRICS = (("psnr", "PSNR (dB)"), ("ssim", "SSIM"))
 
 
-def unpad(x, native):
-    start = [(t - s) // 2 for s, t in zip(native, x.shape)]
-    return x[tuple(slice(b, b + s) for b, s in zip(start, native))]
-
-
-def to_pixels(x, band, axes, native):
-    return unpad(wv.inverse(wv.unscaled(x.float(), band), axes)[0, 0].clamp(-1, 1), native)
+def to_pixels(x, band, axes, native, joint=False):
+    return oct_region(wv.inverse(wv.unscaled(x.float(), band), axes)[0, 0].clamp(-1, 1), native, joint)
 
 
 def to_uint8(x):
@@ -190,7 +185,9 @@ def main():
     if empty:
         raise SystemExit("this run's split has no %s scans" % " or ".join(empty))
     target, slo_size, band, saved = tuple(ckpt["target"]), ckpt.get("slo_size", 0), band_scale(ckpt), options(ckpt)
-    print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], ("%d px" % slo_size + (", adapter" if saved["adapter"] else "")) if slo_size else "not used", "on" if band is not None else "off", device))
+    joint = joint_parts(ckpt, axes) is not None
+    slo_text = ("%d px" % slo_size + (", adapter" if saved["adapter"] else "") + (", cross-attention at levels %s" % " ".join(map(str, saved["xattn"])) if saved["xattn"] else "")) if slo_size else ("joint slice (%s); PSNR and SSIM on the B-scans only" % saved["slo_slice"] if joint else "not used")
+    print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], slo_text, "on" if band is not None else "off", device))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
     part_of = {pid: p for p in PARTS for pid in split.get(p, [])}
@@ -221,7 +218,7 @@ def main():
         for k, i in enumerate(chosen):
             s = scans[i]
             try:
-                real = scale(load_volume(s["folder"], s["n"], saved["keep"]))
+                real, full = assemble(s["folder"], s["n"], target, saved["keep"], saved["slo_slice"])
                 slo = to_device(as_batch(load_condition(s["folder"], s["n"], slo_size, saved["adapter"], real.shape, target, saved["keep"])), device)
             except Exception as e:
                 failed += 1
@@ -229,7 +226,7 @@ def main():
                 continue
             native = real.shape
             ref = torch.from_numpy(real).to(device)
-            x0 = wv.scaled(wv.forward(torch.from_numpy(pad(real, target))[None, None].to(device), axes), band)
+            x0 = wv.scaled(wv.forward(torch.from_numpy(full)[None, None].to(device), axes), band)
             noise = torch.randn(x0.shape, generator=torch.Generator().manual_seed(args.seed + i)).to(device)
             row = {"part": s["part"]}
             for c in args.group:
@@ -239,8 +236,8 @@ def main():
                 noisy = ddim.add_noise(original_samples=x0, noise=noise, timesteps=t)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     pred = predict(model, noisy, t, slo)
-                made = to_pixels(pred, band, axes, native)
-                seen = to_pixels(noisy, band, axes, native)
+                made = to_pixels(pred, band, axes, native, joint)
+                seen = to_pixels(noisy, band, axes, native, joint)
                 row["psnr_t%d" % t_value] = ev.psnr(made, ref)
                 row["noisy_psnr_t%d" % t_value] = ev.psnr(seen, ref)
                 row["ssim_t%d" % t_value] = ev.ssim(made, ref)

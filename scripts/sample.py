@@ -15,7 +15,7 @@ from oct_wd import alignment as al
 from oct_wd import cohort as co
 from oct_wd import wavelet as wv
 from oct_wd.model import band_scale, joint_parts, load_checkpoint, options, predict, to_device
-from oct_wd.volumes import as_batch, assemble, load_condition, load_volume, oct_region, other_index, raster_row, scale, slo_region, with_other_slo
+from oct_wd.volumes import as_batch, assemble, load_condition, load_slo_slice, load_volume, oct_region, other_index, raster_row, scale, slo_region, with_other_slo
 
 EVAL_STEPS = (50, 200, 500, 800, 950)
 
@@ -80,6 +80,18 @@ def correspondence(label, vols, slos):
     print("  %-10s own SLO %.3f (min %.3f, max %.3f)   another scan's SLO %.3f" % (label, np.mean(own), np.min(own), np.max(own), np.mean(other)))
 
 
+def similarity(label, vols, slos=None):
+    pairs = [(i, j) for i in range(len(vols)) for j in range(i + 1, len(vols))]
+    if not pairs:
+        return
+    views = [al.highpass(al.en_face(to_uint8(v).astype(np.float32))) for v in vols]
+    text = "  %-10s en-face views %.3f" % (label, np.mean([al.corr(views[i], views[j]) for i, j in pairs]))
+    if slos is not None:
+        flat = [al.highpass(np.asarray(a, dtype=np.float32)) for a in slos]
+        text += "   SLOs %.3f" % np.mean([al.corr(flat[i], flat[j]) for i, j in pairs])
+    print(text)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
@@ -87,6 +99,7 @@ def main():
     ap.add_argument("--n-samples", type=int, default=4)
     ap.add_argument("--ddim-steps", type=int, default=200)
     ap.add_argument("--n-eval", type=int, default=20)
+    ap.add_argument("--n-given", type=int, default=8, help="models with an own noise step for the SLO: scans generated from a validation scan's real SLO")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -108,7 +121,7 @@ def main():
     if slo_size:
         slo_text = "%d px" % slo_size + (", adapter" if saved["adapter"] else "") + (", cross-attention at levels %s" % " ".join(map(str, saved["xattn"])) if saved["xattn"] else "")
     elif joint:
-        slo_text = "joint slice (%s)" % saved["slo_slice"]
+        slo_text = "joint slice (%s)" % saved["slo_slice"] + (", own noise step" if saved["own_step"] else "")
     print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], slo_text, "on" if band is not None else "off", device))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])
@@ -119,24 +132,30 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     real, clean, slos, real_slo = [], [], [], []
-    chosen = val[: max(args.n_eval, args.n_samples)]
+    own_step = saved["own_step"]
+    chosen = val[: max(args.n_eval, args.n_samples, args.n_given if own_step else 0)]
     for s in chosen:
         vol = load_volume(s["folder"], s["n"], saved["keep"])
         real.append(vol)
         _, full = assemble(s["folder"], s["n"], target, saved["keep"], saved["slo_slice"])
         if joint:
             real_slo.append(slo_region(full, vol.shape))
+        elif slo_size:
+            real_slo.append(load_slo_slice(s["folder"], s["n"], target[1:], saved["keep"]))
         clean.append(wv.scaled(wv.forward(torch.from_numpy(full)[None, None], axes), band))
         if slo_size:
             slos.append(as_batch(load_condition(s["folder"], s["n"], slo_size, saved["adapter"], vol.shape, target, saved["keep"])))
     n_samples = min(args.n_samples, len(chosen))
     conditions = [("own SLO", lambda i: slos[i]), ("other SLO", lambda i: with_other_slo(slos[i], slos[other_index(i, len(slos))])), ("no SLO", lambda i: None)] if slo_size else [("model", lambda i: None)]
+    if own_step:
+        conditions = [("same step", None), ("own SLO clean", "own"), ("other SLO clean", "other"), ("SLO all noise", "noise")]
+        (o0, o1), (s0, s1) = joint
     native = real[0].shape
     average = torch.cat(clean).mean(dim=0, keepdim=True)
     ddim = DDIMScheduler(num_train_timesteps=1000, schedule="linear_beta", prediction_type="sample", clip_sample=True)
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
 
-    print("denoising on %d validation scans (lower is better; ratio 1 means no better than the average scan):" % len(clean))
+    print("denoising on %d validation scans (lower is better; ratio 1 means no better than the average scan%s):" % (len(clean), "; B-scans only" if own_step else ""))
     print("  %-8s %-14s %s" % ("noise t", "average MSE", "   ".join("ratio, %s" % name for name, _ in conditions)))
     with torch.no_grad():
         for t_value in EVAL_STEPS:
@@ -145,6 +164,19 @@ def main():
                 noise = torch.randn(x0.shape, generator=gen).to(device)
                 t = torch.full((1,), t_value, device=device, dtype=torch.long)
                 noisy = ddim.add_noise(original_samples=x0.to(device), noise=noise, timesteps=t)
+                if own_step:
+                    for k, (_, given) in enumerate(conditions):
+                        x_in, t_slo = noisy, None
+                        if given is not None:
+                            x_slo = clean[other_index(i, len(clean)) if given == "other" else i][:, :, s0:s1].to(device)
+                            t_slo = torch.full((1,), 999 if given == "noise" else -1, device=device, dtype=torch.long)
+                            x_in = noisy.clone()
+                            x_in[:, :, s0:s1] = ddim.add_noise(original_samples=x_slo, noise=noise[:, :, s0:s1], timesteps=t_slo.clamp_min(0)) if given == "noise" else x_slo
+                        with torch.amp.autocast("cuda", enabled=use_amp):
+                            pred = predict(model, x_in, t, None, t_slo)
+                        errs[k] += torch.nn.functional.mse_loss(pred.float().cpu()[:, :, o0:o1], x0[:, :, o0:o1]).item()
+                    avg_err += torch.nn.functional.mse_loss(average[:, :, o0:o1], x0[:, :, o0:o1]).item()
+                    continue
                 for k, (_, pick) in enumerate(conditions):
                     slo = pick(i)
                     with torch.amp.autocast("cuda", enabled=use_amp):
@@ -172,6 +204,25 @@ def main():
                 Image.fromarray(to_uint8(made_slo[-1])).save(os.path.join(out, "sample_%03d_slo.png" % i))
             print("generated %d of %d%s" % (i + 1, n_samples, " from the SLO of real_%03d" % i if slo_size else ""), flush=True)
 
+        given = []
+        n_given = min(args.n_given, len(chosen)) if own_step else 0
+        clean_step = torch.full((1,), -1, device=device, dtype=torch.long)
+        for i in range(n_given):
+            x_slo = clean[i][:, :, s0:s1].to(device)
+            x = torch.randn((1, wv.channels(axes)) + grid, generator=gen).to(device)
+            for t_value in ddim.timesteps:
+                x[:, :, s0:s1] = x_slo
+                t = torch.full((1,), int(t_value), device=device, dtype=torch.long)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    pred = predict(model, x, t, None, clean_step)
+                x, _ = ddim.step(wv.unscaled(pred.float(), band), int(t_value), wv.unscaled(x, band))
+                x = wv.scaled(x, band)
+            x[:, :, s0:s1] = x_slo
+            pixels = wv.inverse(wv.unscaled(x, band).cpu(), axes)[0, 0].clamp(-1, 1).numpy()
+            given.append(oct_region(pixels, native, True))
+            save_view(to_uint8(given[-1]), os.path.join(out, "given_%03d.png" % i))
+            print("generated %d of %d from the real SLO of validation scan %d" % (i + 1, n_given, i), flush=True)
+
     for i, vol in enumerate(real[:n_samples]):
         save_view(vol, os.path.join(out, "real_%03d.png" % i))
         if joint:
@@ -187,7 +238,23 @@ def main():
         print("OCT en-face view against the SLO along the scan lines (correlation after high-pass, as in the alignment check):")
         correspondence("real", [scale(v) for v in real[:n_samples]], real_slo[:n_samples])
         correspondence("generated", made, made_slo)
-    print("images written:", (4 if joint else 2) * len(made))
+        print("similarity between different scans (mean correlation over pairs, after high-pass; real scans share almost nothing):")
+        similarity("real", [scale(v) for v in real[:n_samples]], real_slo[:n_samples])
+        similarity("generated", made, made_slo)
+    from_slo = given if given else (made if slo_size else [])
+    if from_slo:
+        n = len(from_slo)
+        print("OCT generated from a given real SLO, %d scans: en-face view against that SLO and against another scan's:" % n)
+        correspondence("real", [scale(v) for v in real[:n]], real_slo[:n])
+        correspondence("from SLO", from_slo, real_slo[:n])
+        print("similarity between different scans (en-face views, as above):")
+        similarity("real", [scale(v) for v in real[:n]])
+        similarity("from SLO", from_slo)
+    if given:
+        print("intensity on the -1 to 1 scale, OCT from a given SLO:")
+        describe("real", [scale(v) for v in real[:len(given)]])
+        describe("from SLO", given)
+    print("images written:", (4 if joint else 2) * len(made) + len(given))
 
 
 try:

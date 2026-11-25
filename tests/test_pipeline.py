@@ -17,6 +17,8 @@ from PIL import Image
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+from generative.networks.schedulers import DDPMScheduler
+
 from oct_wd import alignment as al
 from oct_wd import cohort as co
 from oct_wd import evaluate as ev
@@ -862,6 +864,47 @@ def test_slo_parts(root):
         split = mo.Encoder(plain, zparts=((0, 12), (12, 13))).eval()(x, t)
     assert split.shape == (2, 1120), split.shape
 
+    stepped = mo.build_model(32, part=(12, 13)).eval()
+    with torch.no_grad():
+        for prm in stepped.unet.parameters():
+            if (prm == 0).all():
+                prm.normal_(0, 0.02)
+    assert isinstance(stepped, mo.PartNoiseUNet) and stepped.unet.conv_in.conv.in_channels == 33
+    level = stepped.step.level(torch.tensor([-1, 0, 999]))
+    assert level[0] == 0 and 0 < level[1] < 0.02 and level[2] > 0.99, level
+    m, inject = stepped.step.inputs(x, t, torch.tensor([-1, 999]))
+    assert m.shape == (2, 33, 16, 32, 32) and torch.equal(m[:, :32], x)
+    assert (m[0, 32, 12] == 0).all() and torch.allclose(m[1, 32, 12], level[2].expand(32, 32)) and torch.allclose(m[0, 32, :12], stepped.step.level(t[:1]).expand(12, 32, 32))
+    emb = torch.randn(2, stepped.unet.time_embed[-1].out_features)
+    assert torch.equal(inject.time(emb), emb), "the SLO step embedding must start at zero"
+    with torch.no_grad():
+        shared = mo.predict(stepped, x, t)
+        assert torch.allclose(shared, mo.predict(stepped, x, t, None, t)), "no SLO step means the OCT's step"
+        assert not torch.allclose(shared, mo.predict(stepped, x, t, None, torch.tensor([-1, -1])))
+        for prm in stepped.step.mlp.parameters():
+            prm.normal_(0, 0.5)
+        assert not torch.allclose(inject.time(emb), emb)
+        sfeat = mo.Encoder(stepped, zparts=((0, 12), (12, 13))).eval()(x, t)
+    assert sfeat.shape == (2, 1120) and torch.isfinite(sfeat).all()
+    assert fails(lambda: mo.build_model(32, 64, part=(12, 13))).startswith("an own noise step for the SLO slice needs the joint model")
+    assert mo.model_args({"design": "w2z1", "keep_slices": 24, "slo_slice": "raster", "slo_own_step": True})["part"] == (12, 13)
+    assert mo.model_args({"design": "w2z1", "keep_slices": 24, "slo_slice": "raster"})["part"] is None
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("train_script", os.path.join(REPO, "scripts", "train.py"))
+    tr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tr)
+    torch.manual_seed(1)
+    tt = torch.randint(0, 1000, (20000,))
+    ts = tr.slo_steps(tt, 0.25, 0.25)
+    clean, same = (ts == -1).float().mean().item(), (ts == tt).float().mean().item()
+    assert abs(clean - 0.25) < 0.02 and abs(same - 0.25) < 0.02 and ts.min() >= -1 and ts.max() <= 999, (clean, same)
+    sched = DDPMScheduler(num_train_timesteps=1000, schedule="linear_beta", prediction_type="sample")
+    x0, noise = torch.rand(2, 32, 16, 4, 4), torch.randn(2, 32, 16, 4, 4)
+    noisy = sched.add_noise(original_samples=x0, noise=noise, timesteps=t)
+    given = tr.with_slo(noisy, x0[:, :, 12:13], noise[:, :, 12:13], torch.tensor([-1, 500]), sched, 12, 13)
+    assert torch.equal(given[0, :, 12:13], x0[0, :, 12:13]) and torch.equal(given[:, :, :12], noisy[:, :, :12]) and torch.equal(given[:, :, 13:], noisy[:, :, 13:])
+    assert torch.allclose(given[1:, :, 12:13], sched.add_noise(original_samples=x0[1:, :, 12:13], noise=noise[1:, :, 12:13], timesteps=torch.tensor([500])))
+
     folder = sorted(glob.glob(os.path.join(root, "oct_images", "*FAKEUID3")))[0]
     vol, full = vo.assemble(folder, 25, (32, 64, 64), keep=24, slo_slice="raster")
     assert vol.shape == (24, DEPTH, WIDTH) and full.shape == (32, 64, 64) and full.dtype == np.float32
@@ -901,7 +944,7 @@ def test_slo_runs(root, tmp):
     code, out = run("scripts/train.py", *common, "--out", os.path.join(tmp, "run_xattn_no_slo"), "--target", "32", "64", "64", "--slo-xattn", "1", "--epochs", "1")
     assert code != 0 and "--slo-xattn needs --slo-size" in out, out
     code, out = run("scripts/sample.py", "--run", wide, "--root", root, "--n-samples", "1", "--ddim-steps", "2", "--n-eval", "2")
-    assert code == 0 and "cross-attention at levels 0 1 2" in out and "ratio, own SLO" in out, out
+    assert code == 0 and "cross-attention at levels 0 1 2" in out and "ratio, own SLO" in out and "OCT generated from a given real SLO, 1 scans" in out and "from SLO   own SLO" in out, out
     no_leak(out, "sample with SLO cross-attention")
     for extra in ([], ["--slo-features"], ["--slo-features", "--random-init"], ["--slo-features", "--mode", "finetune", "--epochs", "1"]):
         code, out = run("scripts/downstream.py", "--run", wide, "--root", root, "--task", "righteye", "--workers", "0", "--n-boot", "50", *extra)
@@ -935,6 +978,7 @@ def test_slo_runs(root, tmp):
     assert code != 0 and "two free slices" in out, out
     code, out = run("scripts/sample.py", "--run", joint, "--root", root, "--n-samples", "2", "--ddim-steps", "2", "--n-eval", "2")
     assert code == 0 and "joint slice (raster)" in out and "SLO slice, intensity" in out and "OCT en-face view against the SLO" in out and "images written: 8" in out, out
+    assert "similarity between different scans" in out and "generated  en-face views" in out and "SLOs" in out and "given real SLO" not in out, out
     no_leak(out, "sample from the joint model")
     print(out)
     with Image.open(os.path.join(joint, "samples", "sample_000_slo.png")) as im:
@@ -951,6 +995,36 @@ def test_slo_runs(root, tmp):
     code, out = run("scripts/scan_report.py", "--run", joint, "--root", root, "--out", report, "--max-scans", "2", "--steps", "50", "--group", "--n-worst", "1")
     assert code == 0 and "PSNR and SSIM on the B-scans only" in out and "scored 2 scans, could not read 0" in out, out
     no_leak(out, "scan report on the joint model")
+
+    step = os.path.join(tmp, "run_joint_step")
+    step_base = [a if a != joint else step for a in joint_base] + ["--slo-own-step"]
+    code, out = run(*step_base, "--epochs", "1")
+    assert code == 0 and "own noise step for the SLO (clean 0.25, same step 0.25, independent 0.5)" in out and "OCT given a clean SLO: own" in out and "SLO all noise" in out, out
+    no_leak(out, "train the joint model with an own SLO step")
+    print(out)
+    ckpt = torch.load(os.path.join(step, "latest.pt"), map_location="cpu", weights_only=False)
+    assert ckpt["slo_own_step"] and ckpt["slo_clean"] == 0.25 and any(k.startswith("step.mlp.") for k in ckpt["model"]) and all(torch.isfinite(v).all() for v in ckpt["model"].values())
+    code, out = run(*step_base, "--epochs", "2", "--auto-resume")
+    assert code == 0 and "resumed after epoch 1" in out, out
+    code, out = run(*step_base[:-1], "--epochs", "3", "--auto-resume")
+    assert code != 0 and "trained with an own noise step" in out, out
+    code, out = run(*[a for a in step_base if a not in ("--slo-slice", "raster")][:-1] + ["--out", os.path.join(tmp, "run_step_noslice"), "--slo-own-step", "--epochs", "1"])
+    assert code != 0 and "--slo-own-step needs --slo-slice" in out, out
+    code, out = run(*step_base, "--out", os.path.join(tmp, "run_step_shares"), "--slo-clean", "0.7", "--slo-same", "0.5", "--epochs", "1")
+    assert code != 0 and "add up to at most 1" in out, out
+    code, out = run("scripts/sample.py", "--run", step, "--root", root, "--n-samples", "2", "--ddim-steps", "2", "--n-eval", "2", "--n-given", "2")
+    assert code == 0 and "joint slice (raster), own noise step" in out and "B-scans only" in out and "ratio, own SLO clean" in out and "ratio, SLO all noise" in out, out
+    assert "OCT generated from a given real SLO, 2 scans" in out and "from SLO   own SLO" in out and "from SLO   en-face views" in out and "images written: 10" in out, out
+    no_leak(out, "sample from the joint model with an own SLO step")
+    print(out)
+    with Image.open(os.path.join(step, "samples", "given_001.png")) as im:
+        assert im.size == (WIDTH + 24 * 8 + WIDTH + 20, DEPTH), im.size
+    for extra, size in (([], 1120), (["--joint-pool", "oct", "--random-init"], 560), (["--mode", "finetune", "--epochs", "1"], 1120)):
+        code, out = run("scripts/downstream.py", "--run", step, "--root", root, "--task", "male", "--workers", "0", "--n-boot", "50", *extra)
+        assert code == 0 and "feature size %d" % size in out and "test auroc" in out, out
+        no_leak(out, "downstream on the joint model with an own SLO step")
+    code, out = run("scripts/scan_report.py", "--run", step, "--root", root, "--out", os.path.join(tmp, "report_step"), "--max-scans", "2", "--steps", "50", "--n-worst", "1")
+    assert code == 0 and "scored 2 scans, could not read 0" in out, out
 
 
 def main():

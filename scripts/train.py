@@ -40,6 +40,9 @@ def parse():
     ap.add_argument("--slo-dim", type=int, default=CONTEXT_DIM, help="size of each SLO token")
     ap.add_argument("--slo-xattn", type=int, nargs="*", default=[], help="U-Net encoder levels (0 to 4) that get an extra cross-attention to the SLO tokens, on top of the built-in one at the two deepest levels; needs --slo-size")
     ap.add_argument("--slo-slice", default=None, choices=("raster", "full"), help="joint model: append the SLO as its own slice after the B-scans, resampled onto the scan raster (raster) or whole (full); needs an even number of B-scans and two free slices in --target")
+    ap.add_argument("--slo-own-step", action="store_true", help="joint model: give the SLO slice its own noise step, drawn apart from the OCT's, so the model also learns the OCT given a clean SLO; needs --slo-slice")
+    ap.add_argument("--slo-clean", type=float, default=0.25, help="with --slo-own-step: share of training scans whose SLO slice is left clean")
+    ap.add_argument("--slo-same", type=float, default=0.25, help="with --slo-own-step: share of training scans whose SLO slice gets the OCT's noise step; the rest get an independent step")
     ap.add_argument("--keep-slices", type=int, default=0, help="keep this many middle B-scans of each scan, 0 for all; 24 of 25 drops the last")
     ap.add_argument("--z-down", type=int, nargs=4, default=list(Z_DOWN), choices=(0, 1), help="for each of the U-Net's four downsamplings, 1 if it also halves the slice axis")
     ap.add_argument("--band-scale", type=float, nargs="?", const=1.0, default=0.0, help="divide each wavelet band by its root mean square on the training scans raised to this power (1 if given alone, 0.5 for the square root) before noise is added, so fine detail is not buried under the noise; sampling and heads read the divisors from the checkpoint")
@@ -85,13 +88,25 @@ def region_mse(pred, x0, lo, hi):
     return torch.nn.functional.mse_loss(pred[:, :, lo:hi].float(), x0[:, :, lo:hi], reduction="sum").item() / x0[0, :, lo:hi].numel()
 
 
+def slo_steps(t, clean, same):
+    u = torch.rand(t.shape, device=t.device)
+    own = torch.randint(0, 1000, t.shape, device=t.device)
+    return torch.where(u < clean, torch.full_like(t, -1), torch.where(u < clean + same, t, own))
+
+
+def with_slo(noisy, x0_slo, noise_slo, t_slo, sched, s0, s1):
+    x = noisy.clone()
+    x[:, :, s0:s1] = torch.where((t_slo < 0)[:, None, None, None, None], x0_slo, sched.add_noise(original_samples=x0_slo, noise=noise_slo, timesteps=t_slo.clamp_min(0)))
+    return x
+
+
 @torch.no_grad()
-def validate(model, loader, axes, sched, device, use_amp, max_steps, conditioned, band, joint=None):
+def validate(model, loader, axes, sched, device, use_amp, max_steps, conditioned, band, joint=None, own_step=False):
     model.eval()
     gen = torch.Generator(device="cpu").manual_seed(1234)
     names = ("own", "other", "none") if conditioned else ("none",)
     total, count = dict.fromkeys(names, 0.0), 0
-    parts, pairs = dict.fromkeys(("oct", "slo", "oct_other_slo", "oct_paired"), 0.0), 0
+    parts, pairs = dict.fromkeys(("oct", "slo", "oct_other_slo", "oct_paired", "oct_clean_own", "oct_clean_other", "oct_slo_noise"), 0.0), 0
     for step, batch in enumerate(loader):
         if max_steps and step >= max_steps:
             break
@@ -116,11 +131,20 @@ def validate(model, loader, axes, sched, device, use_amp, max_steps, conditioned
                 parts["oct_other_slo"] += region_mse(pred_other, x0, lo, hi) * x0.shape[0]
                 parts["oct_paired"] += region_mse(pred, x0, lo, hi) * x0.shape[0]
                 pairs += x0.shape[0]
+                if own_step:
+                    clean = torch.full_like(t, -1)
+                    for key, x_slo, t_slo in (("oct_clean_own", x0, clean), ("oct_clean_other", x0.roll(1, 0), clean), ("oct_slo_noise", x0, torch.full_like(t, 999))):
+                        given = with_slo(noisy, x_slo[:, :, s0:s1], noise[:, :, s0:s1], t_slo, sched, s0, s1)
+                        with torch.amp.autocast("cuda", enabled=use_amp):
+                            p = predict(model, given, t, None, t_slo)
+                        parts[key] += region_mse(p, x0, lo, hi) * x0.shape[0]
         count += x0.shape[0]
     model.train()
     out = {k: v / max(count, 1) for k, v in total.items()}
     if joint is not None:
         out.update(oct=parts["oct"] / max(count, 1), slo=parts["slo"] / max(count, 1), oct_own_slo=parts["oct_paired"] / max(pairs, 1), oct_other_slo=parts["oct_other_slo"] / max(pairs, 1))
+        if own_step:
+            out.update({k: parts[k] / max(pairs, 1) for k in ("oct_clean_own", "oct_clean_other", "oct_slo_noise")})
     return out
 
 
@@ -142,6 +166,10 @@ def main():
         raise SystemExit("--slo-xattn needs --slo-size")
     if args.slo_slice and conditioned:
         raise SystemExit("--slo-slice is a joint model without the SLO encoder; leave out --slo-size")
+    if args.slo_own_step and not args.slo_slice:
+        raise SystemExit("--slo-own-step needs --slo-slice")
+    if not (0 <= args.slo_clean and 0 <= args.slo_same and args.slo_clean + args.slo_same <= 1):
+        raise SystemExit("--slo-clean and --slo-same are shares from 0 to 1 that add up to at most 1")
     if args.slo_slice and (args.keep_slices or args.n_slices) % 2:
         raise SystemExit("--slo-slice needs an even number of B-scans; use --keep-slices 24")
     if args.slo_slice and (args.keep_slices or args.n_slices) + 2 > args.target[0]:
@@ -168,6 +196,8 @@ def main():
             raise SystemExit("latest.pt was trained with SLO adapter %s, slices kept %s, slice-axis halving %s" % ("on" if saved["adapter"] else "off", saved["keep"] or "all", " ".join(map(str, saved["z_down"]))))
         if (saved["tokens"], saved["dim"], tuple(sorted(saved["xattn"])), saved["slo_slice"]) != (args.slo_tokens, args.slo_dim, tuple(sorted(set(args.slo_xattn))), args.slo_slice):
             raise SystemExit("latest.pt was trained with SLO tokens %d, token size %d, cross-attention levels %s, SLO slice %s" % (saved["tokens"], saved["dim"], " ".join(map(str, saved["xattn"])) or "none", saved["slo_slice"] or "none"))
+        if saved["own_step"] != args.slo_own_step:
+            raise SystemExit("latest.pt was trained %s an own noise step for the SLO slice" % ("with" if saved["own_step"] else "without"))
 
     axes = wv.DESIGNS[args.design]
     n_ch = wv.channels(axes)
@@ -180,6 +210,8 @@ def main():
         slo_text = "%d px" % args.slo_size + (", %d tokens of %d" % (args.slo_tokens ** 2, args.slo_dim) if (args.slo_tokens, args.slo_dim) != (8, CONTEXT_DIM) else "") + (", adapter" if args.slo_adapter else "") + (", cross-attention at levels %s" % " ".join(map(str, sorted(set(args.slo_xattn)))) if args.slo_xattn else "")
     elif args.slo_slice:
         slo_text = "joint, own slice after the B-scans (%s)" % args.slo_slice
+        if args.slo_own_step:
+            slo_text += ", own noise step for the SLO (clean %g, same step %g, independent %g)" % (args.slo_clean, args.slo_same, 1 - args.slo_clean - args.slo_same)
     print("design %s: %d channels, target %s, wavelet grid %s, SLO %s, device %s" % (args.design, n_ch, tuple(args.target), grid, slo_text, device))
     if args.keep_slices or tuple(args.z_down) != Z_DOWN:
         print("B-scans kept: %s of %d; slice axis halved at %d of 4 downsamplings (%s)" % (args.keep_slices or "all", args.n_slices, sum(args.z_down), " ".join(map(str, args.z_down))))
@@ -232,7 +264,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(OctVolumes(train_scans, args.target, args.slo_size, **data), shuffle=True, drop_last=True, **loader_args)
     val_loader = torch.utils.data.DataLoader(OctVolumes(val_scans, args.target, args.slo_size, other=conditioned, **data), shuffle=False, **loader_args)
 
-    model = build_model(n_ch, args.slo_size, args.slo_adapter, tuple(args.z_down), args.slo_tokens, args.slo_dim, sorted(set(args.slo_xattn))).to(device)
+    model = build_model(n_ch, args.slo_size, args.slo_adapter, tuple(args.z_down), args.slo_tokens, args.slo_dim, sorted(set(args.slo_xattn)), joint[1] if args.slo_own_step else None).to(device)
     print("parameters: %d" % sum(p.numel() for p in model.parameters()))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -261,13 +293,25 @@ def main():
             noise = torch.randn_like(x0)
             t = torch.randint(0, 1000, (x0.shape[0],), device=device)
             noisy = sched.add_noise(original_samples=x0, noise=noise, timesteps=t)
+            weight = None
+            if args.slo_own_step:
+                s0, s1 = joint[1]
+                t_slo = slo_steps(t, args.slo_clean, args.slo_same)
+                noisy = with_slo(noisy, x0[:, :, s0:s1], noise[:, :, s0:s1], t_slo, sched, s0, s1)
+                weight = torch.ones((x0.shape[0], 1) + x0.shape[2:], device=device)
+                weight[:, :, s0:s1] = (t_slo >= 0).float()[:, None, None, None, None]
             with torch.amp.autocast("cuda", enabled=use_amp):
                 if conditioned:
                     keep = torch.rand(x0.shape[0], device=device) >= args.slo_drop
                     pred = model(noisy, t, slo, keep)
+                elif args.slo_own_step:
+                    pred = model(noisy, t, t_slo)
                 else:
                     pred = model(x=noisy, timesteps=t)
-                loss = torch.nn.functional.mse_loss(pred.float(), x0)
+                if weight is None:
+                    loss = torch.nn.functional.mse_loss(pred.float(), x0)
+                else:
+                    loss = ((pred.float() - x0).pow(2) * weight).sum() / (weight.sum() * x0.shape[1])
             if not torch.isfinite(loss):
                 raise SystemExit("non-finite loss at epoch %d step %d" % (epoch, step))
             scaler.scale(loss / args.accum).backward()
@@ -279,18 +323,20 @@ def main():
             steps += 1
         if steps < args.accum:
             raise SystemExit("no optimizer step ran: fewer batches than --accum")
-        val = validate(model, val_loader, axes, sched, device, use_amp, args.max_steps, conditioned, band, joint)
+        val = validate(model, val_loader, axes, sched, device, use_amp, args.max_steps, conditioned, band, joint, args.slo_own_step)
         peak = torch.cuda.max_memory_allocated() / 2**30 if use_amp else float("nan")
         if conditioned:
             shown = "val mse %.6f (own SLO)  other SLO %.6f  no SLO %.6f" % (val["own"], val["other"], val["none"])
         elif joint is not None:
             shown = "val mse %.6f (OCT %.6f, SLO %.6f)  OCT with own SLO slice %.6f  with another scan's %.6f" % (val["none"], val["oct"], val["slo"], val["oct_own_slo"], val["oct_other_slo"])
+            if args.slo_own_step:
+                shown += "  OCT given a clean SLO: own %.6f  another scan's %.6f  SLO all noise %.6f" % (val["oct_clean_own"], val["oct_clean_other"], val["oct_slo_noise"])
         else:
             shown = "val mse %.6f" % val["none"]
         print("epoch %d: train mse %.6f  %s  %.0f s  peak %.2f GiB  steps %d" % (epoch, total / steps, shown, time.time() - started, peak, steps), flush=True)
 
         path = os.path.join(args.out, "epoch_%04d.pt" % epoch)
-        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist(), "band_rms": None if rms is None else rms.tolist(), "band_power": args.band_scale, "slo_adapter": args.slo_adapter, "keep_slices": args.keep_slices, "z_down": list(args.z_down), "slo_tokens": args.slo_tokens, "slo_dim": args.slo_dim, "slo_xattn": sorted(set(args.slo_xattn)), "slo_slice": args.slo_slice}
+        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist(), "band_rms": None if rms is None else rms.tolist(), "band_power": args.band_scale, "slo_adapter": args.slo_adapter, "keep_slices": args.keep_slices, "z_down": list(args.z_down), "slo_tokens": args.slo_tokens, "slo_dim": args.slo_dim, "slo_xattn": sorted(set(args.slo_xattn)), "slo_slice": args.slo_slice, "slo_own_step": args.slo_own_step, "slo_clean": args.slo_clean, "slo_same": args.slo_same}
         torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
         torch.save(state, latest + ".tmp")

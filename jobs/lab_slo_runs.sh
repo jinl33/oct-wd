@@ -21,6 +21,10 @@ for RUN in ${SLO_RUNS:-xattn joint}; do
             echo "== w2z1_joint: train"
             python scripts/train.py --out "$RUNS/w2z1_joint" --design w2z1 --band-scale 0.5 --batch-size 4 --epochs ${EPOCHS:-200} --auto-resume $FLAT --target 32 512 512 --slo-slice raster || FAILED=$((FAILED + 1))
             ;;
+        joint_step)
+            echo "== w2z1_joint_step: train"
+            python scripts/train.py --out "$RUNS/w2z1_joint_step" --design w2z1 --band-scale 0.5 --batch-size 4 --epochs ${EPOCHS:-200} --auto-resume $FLAT --target 32 512 512 --slo-slice raster --slo-own-step || FAILED=$((FAILED + 1))
+            ;;
         *)
             echo "unknown run $RUN"
             FAILED=$((FAILED + 1))

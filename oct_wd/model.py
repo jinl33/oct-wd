@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from generative.networks.nets import DiffusionModelUNet
 from generative.networks.nets.diffusion_model_unet import get_timestep_embedding
+from generative.networks.schedulers import DDPMScheduler
 
 from oct_wd import wavelet as wv
 
@@ -20,10 +21,10 @@ class ZUpsample(torch.nn.Module):
         return self.conv(x)
 
 
-def build_unet(n_channels, context_dim=None, z_down=Z_DOWN):
+def build_unet(n_channels, context_dim=None, z_down=Z_DOWN, extra_in=0):
     unet = DiffusionModelUNet(
         spatial_dims=3,
-        in_channels=n_channels,
+        in_channels=n_channels + extra_in,
         out_channels=n_channels,
         num_channels=[40, 40, 80, 80, 160],
         norm_num_groups=8,
@@ -212,6 +213,51 @@ def decode(unet, h, skips, emb, context=None):
     return unet.out(h)
 
 
+class SloStep(torch.nn.Module):
+    def __init__(self, part, base, temb_dim):
+        super().__init__()
+        self.part = tuple(part)
+        self.base = base
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(base, temb_dim), torch.nn.SiLU(), torch.nn.Linear(temb_dim, temb_dim))
+        torch.nn.init.zeros_(self.mlp[-1].weight)
+        torch.nn.init.zeros_(self.mlp[-1].bias)
+        std = (1 - DDPMScheduler(num_train_timesteps=1000, schedule="linear_beta").alphas_cumprod).sqrt().float()
+        self.register_buffer("std", std, persistent=False)
+
+    def level(self, t):
+        return self.std[t.clamp_min(0)] * (t >= 0)
+
+    def inputs(self, x, t, t_slo=None):
+        t_slo = t if t_slo is None else t_slo
+        lo, hi = self.part
+        m = self.level(t)[:, None, None, None, None].repeat(1, 1, *x.shape[2:])
+        m[:, :, lo:hi] = self.level(t_slo)[:, None, None, None, None]
+        return torch.cat([x, m.to(x.dtype)], dim=1), StepInjection(self, t_slo)
+
+
+class StepInjection:
+    def __init__(self, step, t_slo):
+        self.step, self.t_slo = step, t_slo
+
+    def time(self, emb):
+        return emb + self.step.mlp(get_timestep_embedding(self.t_slo + 1, self.step.base)).to(emb.dtype)
+
+    def __call__(self, level, h):
+        return h
+
+
+class PartNoiseUNet(torch.nn.Module):
+    def __init__(self, n_channels, part, z_down=Z_DOWN):
+        super().__init__()
+        self.unet = build_unet(n_channels, None, z_down, extra_in=1)
+        self.step = SloStep(part, self.unet.block_out_channels[0], self.unet.time_embed[-1].out_features)
+
+    def forward(self, x, timesteps, t_slo=None):
+        x, inject = self.step.inputs(x, timesteps, t_slo)
+        h, skips, emb, _ = encode(self.unet, self.unet.block_out_channels[0], x, timesteps, None, inject)
+        return decode(self.unet, h, skips, emb)
+
+
 class SloDiffusion(torch.nn.Module):
     def __init__(self, n_channels, adapter=False, z_down=Z_DOWN, tokens=8, dim=CONTEXT_DIM, xattn=()):
         super().__init__()
@@ -236,17 +282,23 @@ class SloDiffusion(torch.nn.Module):
         return decode(self.unet, h, skips, emb, context)
 
 
-def build_model(n_channels, slo_size=0, adapter=False, z_down=Z_DOWN, tokens=8, dim=CONTEXT_DIM, xattn=()):
+def build_model(n_channels, slo_size=0, adapter=False, z_down=Z_DOWN, tokens=8, dim=CONTEXT_DIM, xattn=(), part=None):
     if (adapter or xattn) and not slo_size:
         raise ValueError("the SLO adapter and SLO cross-attention need an SLO size")
+    if part is not None:
+        if slo_size:
+            raise ValueError("an own noise step for the SLO slice needs the joint model, without an SLO encoder")
+        return PartNoiseUNet(n_channels, part, z_down)
     if slo_size:
         return SloDiffusion(n_channels, adapter, z_down, tokens, dim, tuple(xattn))
     return build_unet(n_channels, None, z_down)
 
 
-def predict(model, x, t, slo=None):
+def predict(model, x, t, slo=None, t_slo=None):
     if isinstance(model, SloDiffusion):
         return model(x, t, slo)
+    if isinstance(model, PartNoiseUNet):
+        return model(x, t, t_slo)
     return model(x=x, timesteps=t)
 
 
@@ -264,7 +316,8 @@ class Encoder(torch.nn.Module):
         conditioned = isinstance(model, SloDiffusion)
         if slo_features and not conditioned:
             raise ValueError("SLO features need a model with an SLO encoder")
-        unet = model.unet if conditioned else model
+        self.step = model.step if isinstance(model, PartNoiseUNet) else None
+        unet = model.unet if conditioned or self.step is not None else model
         self.slo = model.slo if conditioned else None
         self.adapter = model.adapter if conditioned else None
         self.xattn = getattr(model, "xattn", None) if conditioned else None
@@ -283,6 +336,8 @@ class Encoder(torch.nn.Module):
         context, inject = None, None
         if self.slo is not None:
             context, inject = condition(self.slo, self.adapter, slo, x.shape[0], None, self.xattn)
+        if self.step is not None:
+            x, inject = self.step.inputs(x, t)
         _, _, _, pooled = encode(self, self.base, x, t, context, inject, self.zparts)
         if self.slo_features:
             pooled.append(slo_vector(self.slo, slo, x.shape[0], x.device))
@@ -291,12 +346,14 @@ class Encoder(torch.nn.Module):
 
 def options(ckpt):
     return {"adapter": bool(ckpt.get("slo_adapter", False)), "keep": int(ckpt.get("keep_slices", 0)), "z_down": tuple(ckpt.get("z_down", Z_DOWN)),
-            "tokens": int(ckpt.get("slo_tokens", 8)), "dim": int(ckpt.get("slo_dim", CONTEXT_DIM)), "xattn": tuple(ckpt.get("slo_xattn", ())), "slo_slice": ckpt.get("slo_slice")}
+            "tokens": int(ckpt.get("slo_tokens", 8)), "dim": int(ckpt.get("slo_dim", CONTEXT_DIM)), "xattn": tuple(ckpt.get("slo_xattn", ())), "slo_slice": ckpt.get("slo_slice"),
+            "own_step": bool(ckpt.get("slo_own_step", False))}
 
 
 def model_args(ckpt):
     opt = options(ckpt)
-    return dict(slo_size=ckpt.get("slo_size", 0), adapter=opt["adapter"], z_down=opt["z_down"], tokens=opt["tokens"], dim=opt["dim"], xattn=opt["xattn"])
+    part = joint_parts(ckpt, wv.DESIGNS[ckpt["design"]])[1] if opt["own_step"] else None
+    return dict(slo_size=ckpt.get("slo_size", 0), adapter=opt["adapter"], z_down=opt["z_down"], tokens=opt["tokens"], dim=opt["dim"], xattn=opt["xattn"], part=part)
 
 
 def joint_parts(ckpt, axes):

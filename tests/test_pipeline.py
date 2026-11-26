@@ -889,6 +889,50 @@ def test_slo_parts(root):
     assert fails(lambda: mo.build_model(32, 64, part=(12, 13))).startswith("an own noise step for the SLO slice needs the joint model")
     assert mo.model_args({"design": "w2z1", "keep_slices": 24, "slo_slice": "raster", "slo_own_step": True})["part"] == (12, 13)
     assert mo.model_args({"design": "w2z1", "keep_slices": 24, "slo_slice": "raster"})["part"] is None
+    aligned = mo.build_model(32, 64, z_down=(0, 0, 1, 1), align=True).eval()
+    assert isinstance(aligned, mo.AlignedDiffusion) and aligned.unet.conv_in.conv.in_channels == 32
+    xa = torch.rand(2, 32, 12, 16, 16) * 2 - 1
+    lines = np.array([[r, 10.0, r, 54.0] for r in np.linspace(8, 56, 24)])
+    sgrid = torch.from_numpy(vo.slo_grid(lines, (64, 64), (24, DEPTH, 64), (24, 64, 64)))[None].expand(2, -1, -1, -1).contiguous()
+    simg = torch.rand(2, 64, 64) * 2 - 1
+    with torch.no_grad():
+        o, v, valid, go, gs = aligned.embed(xa, (simg, sgrid))
+        assert torch.equal(mo.predict(aligned, xa, t, simg), aligned.unet(x=xa, timesteps=t)), "the aligned model must denoise without the SLO"
+    assert o.shape == v.shape == (2, 48, mo.ALIGN_DIM) and valid.shape == (2, 48) and valid.all() and go.shape == gs.shape == (2, mo.ALIGN_DIM)
+    assert torch.allclose(o.norm(dim=-1), torch.ones(2, 48), atol=1e-5) and torch.allclose(gs.norm(dim=-1), torch.ones(2), atol=1e-5)
+    dense, whole = mo.align_loss(o, v, valid, go, gs)
+    assert torch.isfinite(dense) and torch.isfinite(whole) and dense > 0 and whole > 0
+    same = mo.info_nce(o[0], o[0])
+    assert same < mo.info_nce(o[0], v[0]), "matching pairs must give a lower contrastive loss"
+    with torch.no_grad():
+        afeat = mo.Encoder(aligned, slo_features=True).eval()(xa, t, simg)
+        bfeat = mo.Encoder(aligned, slo_features=True).eval()(xa, t, simg.flip(0))
+    assert afeat.shape == (2, 720) and torch.equal(afeat[:, :560], bfeat[:, :560]) and not torch.allclose(afeat[:, 560:], bfeat[:, 560:])
+    assert fails(lambda: mo.build_model(32, 0, align=True)).startswith("the aligned model needs an SLO size")
+    assert fails(lambda: mo.build_model(32, 64, xattn=(1,), align=True)).startswith("the aligned model needs")
+    assert fails(lambda: aligned.embed(xa, simg)).startswith("the aligned model needs the SLO together with its scan-line grid")
+    assert mo.model_args({"design": "w2z1", "slo_size": 64, "slo_align": 0.1})["align"] and not mo.model_args({"design": "w2z1"})["align"]
+    jep = mo.build_model(32, 64, z_down=(0, 0, 1, 1), align=True, align_loss="jepa")
+    assert isinstance(jep, mo.JepaAligned) and not any(p.requires_grad for p in jep.target.parameters())
+    online = jep.state_dict()
+    assert all(torch.equal(v, online[k]) for k, v in jep.target.state_dict().items()), "the target encoders must start as copies"
+    dense, whole = jep.terms(xa, (simg, sgrid))
+    assert torch.isfinite(dense) and torch.isfinite(whole) and dense > 0 and whole > 0
+    (dense + whole).backward()
+    assert jep.oct_to_slo[0].weight.grad is not None and jep.slo.body[0].weight.grad is not None and jep.unet.conv_in.conv.weight.grad is not None
+    assert all(p.grad is None for p in jep.target.parameters()), "the targets must get no gradient"
+    with torch.no_grad():
+        before = jep.target.unet.conv_in.conv.weight.clone()
+        jep.unet.conv_in.conv.weight.add_(1.0)
+        jep.update_target(0.5)
+    assert torch.allclose(jep.target.unet.conv_in.conv.weight, before + 0.5), "the target must move halfway at momentum 0.5"
+    with torch.no_grad():
+        a, b, mvalid, wa, wb = jep.eval().match(xa, (simg, sgrid))
+        jfeat = mo.Encoder(jep, slo_features=True).eval()(xa, t, simg)
+    assert a.shape == b.shape == (2, 48, mo.ALIGN_DIM) and wa.shape == wb.shape == (2, mo.ALIGN_DIM) and jfeat.shape == (2, 720)
+    assert not any(n.startswith("target.") for n, _ in mo.Encoder(jep, slo_features=True).named_parameters())
+    assert fails(lambda: mo.build_model(32, 64, align=True, align_loss="mae")).startswith("unknown alignment loss")
+    assert mo.model_args({"design": "w2z1", "slo_size": 64, "slo_align": 0.1, "slo_align_loss": "jepa"})["align_loss"] == "jepa"
     import importlib.util
     spec = importlib.util.spec_from_file_location("train_script", os.path.join(REPO, "scripts", "train.py"))
     tr = importlib.util.module_from_spec(spec)
@@ -1025,6 +1069,55 @@ def test_slo_runs(root, tmp):
         no_leak(out, "downstream on the joint model with an own SLO step")
     code, out = run("scripts/scan_report.py", "--run", step, "--root", root, "--out", os.path.join(tmp, "report_step"), "--max-scans", "2", "--steps", "50", "--n-worst", "1")
     assert code == 0 and "scored 2 scans, could not read 0" in out, out
+
+    al_run = os.path.join(tmp, "run_align")
+    al_base = ["scripts/train.py", *common, "--out", al_run, "--target", "24", "64", "64", "--keep-slices", "24", "--z-down", "0", "0", "1", "1", "--band-scale", "0.5", "--slo-size", "64", "--slo-align", "0.1"]
+    code, out = run(*al_base, "--epochs", "1")
+    assert code == 0 and "own encoder aligned with the OCT encoder by a contrastive loss (weight 0.1), not fed to the denoiser" in out and "same place: own SLO" in out and "own SLO ranked first" in out and "align loss" in out, out
+    no_leak(out, "train the aligned model")
+    print(out)
+    ckpt = torch.load(os.path.join(al_run, "latest.pt"), map_location="cpu", weights_only=False)
+    assert ckpt["slo_align"] == 0.1 and any(k.startswith("slo_dense.") for k in ckpt["model"]) and all(torch.isfinite(v).all() for v in ckpt["model"].values())
+    code, out = run(*al_base, "--epochs", "2", "--auto-resume")
+    assert code == 0 and "resumed after epoch 1" in out, out
+    code, out = run(*al_base[:-1], "0.5", "--epochs", "3", "--auto-resume")
+    assert code != 0 and "trained with SLO alignment weight 0.1" in out, out
+    code, out = run(*al_base, "--out", os.path.join(tmp, "run_align_slice"), "--slo-slice", "raster", "--epochs", "1")
+    assert code != 0 and "keeps the SLO out of the denoiser" in out, out
+    code, out = run("scripts/train.py", *common, "--out", os.path.join(tmp, "run_align_noslo"), "--target", "24", "64", "64", "--keep-slices", "24", "--z-down", "0", "0", "1", "1", "--slo-align", "0.1", "--epochs", "1")
+    assert code != 0 and "--slo-align needs --slo-size" in out, out
+    code, out = run("scripts/sample.py", "--run", al_run, "--root", root, "--n-samples", "2", "--ddim-steps", "2", "--n-eval", "2")
+    assert code == 0 and "aligned encoder (contrastive), not fed to the denoiser" in out and "ratio, model" in out and "given real SLO" not in out and "images written: 4" in out, out
+    no_leak(out, "sample from the aligned model")
+    for extra, size in ((["--slo-features"], 720), ([], 560), (["--slo-features", "--random-init"], 720), (["--slo-features", "--mode", "finetune", "--epochs", "1"], 720)):
+        code, out = run("scripts/downstream.py", "--run", al_run, "--root", root, "--task", "righteye", "--workers", "0", "--n-boot", "50", *extra)
+        assert code == 0 and "aligned encoder" in out and "feature size %d" % size in out and "test auroc" in out, out
+        no_leak(out, "downstream on the aligned model")
+    code, out = run("scripts/scan_report.py", "--run", al_run, "--root", root, "--out", os.path.join(tmp, "report_align"), "--max-scans", "2", "--steps", "50", "--n-worst", "1")
+    assert code == 0 and "scored 2 scans, could not read 0" in out, out
+
+    je_run = os.path.join(tmp, "run_align_jepa")
+    je_base = [a if a != al_run else je_run for a in al_base] + ["--slo-align-loss", "jepa"]
+    code, out = run(*je_base, "--epochs", "1")
+    assert code == 0 and "JEPA-style latent prediction loss (weight 0.1)" in out and "same place: own SLO" in out and "own SLO ranked first" in out, out
+    no_leak(out, "train the JEPA-aligned model")
+    print(out)
+    ckpt = torch.load(os.path.join(je_run, "latest.pt"), map_location="cpu", weights_only=False)
+    m = ckpt["model"]
+    assert ckpt["slo_align_loss"] == "jepa" and any(k.startswith("oct_to_slo.") for k in m) and all(torch.isfinite(v).all() for v in m.values())
+    assert not torch.equal(m["target.unet.conv_in.conv.weight"], m["unet.conv_in.conv.weight"]), "the target must lag the online encoder after training steps"
+    code, out = run(*je_base, "--epochs", "2", "--auto-resume")
+    assert code == 0 and "resumed after epoch 1" in out, out
+    code, out = run(*je_base[:-2], "--epochs", "3", "--auto-resume")
+    assert code != 0 and "loss jepa" in out, out
+    code, out = run(*[a if a != je_run else os.path.join(tmp, "run_jepa_noalign") for a in je_base if a not in ("--slo-align", "0.1")], "--epochs", "1")
+    assert code != 0 and "--slo-align-loss needs --slo-align" in out, out
+    code, out = run("scripts/sample.py", "--run", je_run, "--root", root, "--n-samples", "1", "--ddim-steps", "2", "--n-eval", "2")
+    assert code == 0 and "aligned encoder (jepa), not fed to the denoiser" in out and "images written: 2" in out, out
+    for extra, size in ((["--slo-features"], 720), (["--slo-features", "--random-init"], 720), (["--mode", "finetune", "--epochs", "1"], 560)):
+        code, out = run("scripts/downstream.py", "--run", je_run, "--root", root, "--task", "righteye", "--workers", "0", "--n-boot", "50", *extra)
+        assert code == 0 and "aligned encoder (jepa)" in out and "feature size %d" % size in out and "test auroc" in out, out
+        no_leak(out, "downstream on the JEPA-aligned model")
 
 
 def main():

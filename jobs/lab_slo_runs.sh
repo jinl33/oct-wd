@@ -25,6 +25,18 @@ for RUN in ${SLO_RUNS:-xattn joint}; do
             echo "== w2z1_joint_step: train"
             python scripts/train.py --out "$RUNS/w2z1_joint_step" --design w2z1 --band-scale 0.5 --batch-size 4 --epochs ${EPOCHS:-200} --auto-resume $FLAT --target 32 512 512 --slo-slice raster --slo-own-step || FAILED=$((FAILED + 1))
             ;;
+        align)
+            echo "== w2z1_align: train"
+            python scripts/train.py --out "$RUNS/w2z1_align" --design w2z1 --band-scale 0.5 --batch-size 4 --epochs ${EPOCHS:-200} --auto-resume $FLAT --target 24 512 512 --slo-size 256 --slo-align 0.01 || FAILED=$((FAILED + 1))
+            ;;
+        align_strong)
+            echo "== w2z1_align_strong: train"
+            python scripts/train.py --out "$RUNS/w2z1_align_strong" --design w2z1 --band-scale 0.5 --batch-size 4 --epochs ${EPOCHS:-200} --auto-resume $FLAT --target 24 512 512 --slo-size 256 --slo-align 0.1 || FAILED=$((FAILED + 1))
+            ;;
+        align_jepa)
+            echo "== w2z1_align_jepa: train"
+            python scripts/train.py --out "$RUNS/w2z1_align_jepa" --design w2z1 --band-scale 0.5 --batch-size 4 --epochs ${EPOCHS:-200} --auto-resume $FLAT --target 24 512 512 --slo-size 256 --slo-align 0.01 --slo-align-loss jepa || FAILED=$((FAILED + 1))
+            ;;
         *)
             echo "unknown run $RUN"
             FAILED=$((FAILED + 1))

@@ -185,6 +185,7 @@ def main():
     if empty:
         raise SystemExit("this run's split has no %s scans" % " or ".join(empty))
     target, slo_size, band, saved = tuple(ckpt["target"]), ckpt.get("slo_size", 0), band_scale(ckpt), options(ckpt)
+    slo_size = 0 if saved["align"] else slo_size
     joint = joint_parts(ckpt, axes) is not None
     slo_text = ("%d px" % slo_size + (", adapter" if saved["adapter"] else "") + (", cross-attention at levels %s" % " ".join(map(str, saved["xattn"])) if saved["xattn"] else "")) if slo_size else ("joint slice (%s); PSNR and SSIM on the B-scans only" % saved["slo_slice"] if joint else "not used")
     print("checkpoint epoch %d, design %s, SLO %s, band scaling %s, device %s" % (ckpt["epoch"], ckpt["design"], slo_text, "on" if band is not None else "off", device))

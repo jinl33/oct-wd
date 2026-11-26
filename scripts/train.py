@@ -15,7 +15,7 @@ from generative.networks.schedulers import DDPMScheduler
 
 from oct_wd import cohort as co
 from oct_wd import wavelet as wv
-from oct_wd.model import CONTEXT_DIM, Z_DOWN, build_model, options, predict, to_device
+from oct_wd.model import CONTEXT_DIM, Z_DOWN, align_loss, build_model, options, predict, to_device
 from oct_wd.volumes import OctVolumes
 
 
@@ -40,6 +40,8 @@ def parse():
     ap.add_argument("--slo-dim", type=int, default=CONTEXT_DIM, help="size of each SLO token")
     ap.add_argument("--slo-xattn", type=int, nargs="*", default=[], help="U-Net encoder levels (0 to 4) that get an extra cross-attention to the SLO tokens, on top of the built-in one at the two deepest levels; needs --slo-size")
     ap.add_argument("--slo-slice", default=None, choices=("raster", "full"), help="joint model: append the SLO as its own slice after the B-scans, resampled onto the scan raster (raster) or whole (full); needs an even number of B-scans and two free slices in --target")
+    ap.add_argument("--slo-align", type=float, default=0.0, help="weight of a contrastive loss that aligns the OCT encoder with a separate SLO encoder, at each place along the scan lines and over the whole scan; the SLO is not fed to the denoiser; needs --slo-size")
+    ap.add_argument("--slo-align-loss", default="contrastive", choices=("contrastive", "jepa"), help="with --slo-align: contrastive (InfoNCE, other scans and places as negatives) or jepa (each modality predicts the other's features from slowly updated copies of the encoders, no negatives)")
     ap.add_argument("--slo-own-step", action="store_true", help="joint model: give the SLO slice its own noise step, drawn apart from the OCT's, so the model also learns the OCT given a clean SLO; needs --slo-slice")
     ap.add_argument("--slo-clean", type=float, default=0.25, help="with --slo-own-step: share of training scans whose SLO slice is left clean")
     ap.add_argument("--slo-same", type=float, default=0.25, help="with --slo-own-step: share of training scans whose SLO slice gets the OCT's noise step; the rest get an independent step")
@@ -101,16 +103,18 @@ def with_slo(noisy, x0_slo, noise_slo, t_slo, sched, s0, s1):
 
 
 @torch.no_grad()
-def validate(model, loader, axes, sched, device, use_amp, max_steps, conditioned, band, joint=None, own_step=False):
+def validate(model, loader, axes, sched, device, use_amp, max_steps, conditioned, band, joint=None, own_step=False, aligned=False):
     model.eval()
     gen = torch.Generator(device="cpu").manual_seed(1234)
     names = ("own", "other", "none") if conditioned else ("none",)
     total, count = dict.fromkeys(names, 0.0), 0
     parts, pairs = dict.fromkeys(("oct", "slo", "oct_other_slo", "oct_paired", "oct_clean_own", "oct_clean_other", "oct_slo_noise"), 0.0), 0
+    near = dict.fromkeys(("own", "other", "n_own", "n_other"), 0.0)
+    whole_oct, whole_slo = [], []
     for step, batch in enumerate(loader):
         if max_steps and step >= max_steps:
             break
-        vol, slo, other = unpack(batch, device, conditioned)
+        vol, slo, other = unpack(batch, device, conditioned or aligned)
         x0 = wv.scaled(wv.forward(vol, axes), band)
         noise = torch.randn(x0.shape, generator=gen).to(device)
         t = torch.randint(0, 1000, (x0.shape[0],), generator=gen).to(device)
@@ -138,9 +142,25 @@ def validate(model, loader, axes, sched, device, use_amp, max_steps, conditioned
                         with torch.amp.autocast("cuda", enabled=use_amp):
                             p = predict(model, given, t, None, t_slo)
                         parts[key] += region_mse(p, x0, lo, hi) * x0.shape[0]
+        if aligned:
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                o, v, valid, go, gs = model.match(x0, slo)
+            near["own"] += (o * v).sum(-1)[valid].sum().item()
+            near["n_own"] += valid.sum().item()
+            if x0.shape[0] > 1:
+                both = valid & valid.roll(1, 0)
+                near["other"] += (o * v.roll(1, 0)).sum(-1)[both].sum().item()
+                near["n_other"] += both.sum().item()
+            whole_oct.append(go)
+            whole_slo.append(gs)
         count += x0.shape[0]
     model.train()
     out = {k: v / max(count, 1) for k, v in total.items()}
+    if aligned:
+        sim = torch.cat(whole_oct) @ torch.cat(whole_slo).t()
+        out.update(near_own=near["own"] / max(near["n_own"], 1), near_other=near["other"] / max(near["n_other"], 1),
+                   whole_own=sim.diagonal().mean().item(), whole_other=(sim.sum() - sim.diagonal().sum()).item() / max(sim.numel() - len(sim), 1),
+                   top1=int((sim.argmax(dim=1) == torch.arange(len(sim), device=sim.device)).sum().item()), n_whole=len(sim))
     if joint is not None:
         out.update(oct=parts["oct"] / max(count, 1), slo=parts["slo"] / max(count, 1), oct_own_slo=parts["oct_paired"] / max(pairs, 1), oct_other_slo=parts["oct_other_slo"] / max(pairs, 1))
         if own_step:
@@ -156,7 +176,17 @@ def main():
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
-    conditioned = args.slo_size > 0
+    aligned = args.slo_align > 0
+    conditioned = args.slo_size > 0 and not aligned
+
+    if args.slo_align < 0:
+        raise SystemExit("--slo-align is a loss weight, 0 or above")
+    if aligned and not args.slo_size:
+        raise SystemExit("--slo-align needs --slo-size")
+    if args.slo_align_loss != "contrastive" and not aligned:
+        raise SystemExit("--slo-align-loss needs --slo-align")
+    if aligned and (args.slo_adapter or args.slo_xattn or args.slo_slice):
+        raise SystemExit("--slo-align keeps the SLO out of the denoiser; leave out --slo-adapter, --slo-xattn and --slo-slice")
 
     if not 0 <= args.band_scale <= 1:
         raise SystemExit("--band-scale takes a power from 0 to 1")
@@ -196,6 +226,8 @@ def main():
             raise SystemExit("latest.pt was trained with SLO adapter %s, slices kept %s, slice-axis halving %s" % ("on" if saved["adapter"] else "off", saved["keep"] or "all", " ".join(map(str, saved["z_down"]))))
         if (saved["tokens"], saved["dim"], tuple(sorted(saved["xattn"])), saved["slo_slice"]) != (args.slo_tokens, args.slo_dim, tuple(sorted(set(args.slo_xattn))), args.slo_slice):
             raise SystemExit("latest.pt was trained with SLO tokens %d, token size %d, cross-attention levels %s, SLO slice %s" % (saved["tokens"], saved["dim"], " ".join(map(str, saved["xattn"])) or "none", saved["slo_slice"] or "none"))
+        if saved["align"] != args.slo_align or (aligned and saved["align_loss"] != args.slo_align_loss):
+            raise SystemExit("latest.pt was trained with SLO alignment weight %g%s" % (saved["align"], ", loss %s" % saved["align_loss"] if saved["align"] else ""))
         if saved["own_step"] != args.slo_own_step:
             raise SystemExit("latest.pt was trained %s an own noise step for the SLO slice" % ("with" if saved["own_step"] else "without"))
 
@@ -206,7 +238,9 @@ def main():
     except ValueError as e:
         raise SystemExit(str(e))
     slo_text = "not used"
-    if conditioned:
+    if aligned:
+        slo_text = "%d px, own encoder aligned with the OCT encoder by a %s loss (weight %g), not fed to the denoiser" % (args.slo_size, "contrastive" if args.slo_align_loss == "contrastive" else "JEPA-style latent prediction", args.slo_align)
+    elif conditioned:
         slo_text = "%d px" % args.slo_size + (", %d tokens of %d" % (args.slo_tokens ** 2, args.slo_dim) if (args.slo_tokens, args.slo_dim) != (8, CONTEXT_DIM) else "") + (", adapter" if args.slo_adapter else "") + (", cross-attention at levels %s" % " ".join(map(str, sorted(set(args.slo_xattn)))) if args.slo_xattn else "")
     elif args.slo_slice:
         slo_text = "joint, own slice after the B-scans (%s)" % args.slo_slice
@@ -256,7 +290,7 @@ def main():
             f.write(json.dumps(dict(record, after_epoch=ckpt["epoch"])) + "\n")
 
     loader_args = dict(batch_size=args.batch_size, num_workers=args.workers, pin_memory=use_amp, persistent_workers=args.workers > 0)
-    data = dict(adapter=args.slo_adapter, keep=args.keep_slices, slo_slice=args.slo_slice)
+    data = dict(adapter=args.slo_adapter or aligned, keep=args.keep_slices, slo_slice=args.slo_slice)
     joint = None
     if args.slo_slice:
         n_oct = (args.keep_slices or args.n_slices) // 2 ** sum(1 for a in axes if a == wv.Z)
@@ -264,9 +298,9 @@ def main():
     train_loader = torch.utils.data.DataLoader(OctVolumes(train_scans, args.target, args.slo_size, **data), shuffle=True, drop_last=True, **loader_args)
     val_loader = torch.utils.data.DataLoader(OctVolumes(val_scans, args.target, args.slo_size, other=conditioned, **data), shuffle=False, **loader_args)
 
-    model = build_model(n_ch, args.slo_size, args.slo_adapter, tuple(args.z_down), args.slo_tokens, args.slo_dim, sorted(set(args.slo_xattn)), joint[1] if args.slo_own_step else None).to(device)
+    model = build_model(n_ch, args.slo_size, args.slo_adapter, tuple(args.z_down), args.slo_tokens, args.slo_dim, sorted(set(args.slo_xattn)), joint[1] if args.slo_own_step else None, aligned, args.slo_align_loss).to(device)
     print("parameters: %d" % sum(p.numel() for p in model.parameters()))
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     sched = DDPMScheduler(num_train_timesteps=1000, schedule="linear_beta", prediction_type="sample")
 
@@ -281,14 +315,14 @@ def main():
 
     for epoch in range(start_epoch + 1, args.epochs + 1):
         started = time.time()
-        total, steps = 0.0, 0
+        total, total_align, steps = 0.0, 0.0, 0
         if use_amp:
             torch.cuda.reset_peak_memory_stats()
         opt.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader):
             if args.max_steps and step >= args.max_steps:
                 break
-            vol, slo, _ = unpack(batch, device, conditioned)
+            vol, slo, _ = unpack(batch, device, conditioned or aligned)
             x0 = wv.scaled(wv.forward(vol, axes), band)
             noise = torch.randn_like(x0)
             t = torch.randint(0, 1000, (x0.shape[0],), device=device)
@@ -312,6 +346,11 @@ def main():
                     loss = torch.nn.functional.mse_loss(pred.float(), x0)
                 else:
                     loss = ((pred.float() - x0).pow(2) * weight).sum() / (weight.sum() * x0.shape[1])
+                mse = loss
+                if aligned:
+                    dense, whole = model.terms(x0, slo) if args.slo_align_loss == "jepa" else align_loss(*model.embed(x0, slo))
+                    contrast = (dense + whole) / 2
+                    loss = mse + args.slo_align * contrast
             if not torch.isfinite(loss):
                 raise SystemExit("non-finite loss at epoch %d step %d" % (epoch, step))
             scaler.scale(loss / args.accum).backward()
@@ -319,11 +358,15 @@ def main():
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
-            total += loss.item()
+                if aligned and args.slo_align_loss == "jepa":
+                    model.update_target()
+            total += mse.item()
+            if aligned:
+                total_align += contrast.item()
             steps += 1
         if steps < args.accum:
             raise SystemExit("no optimizer step ran: fewer batches than --accum")
-        val = validate(model, val_loader, axes, sched, device, use_amp, args.max_steps, conditioned, band, joint, args.slo_own_step)
+        val = validate(model, val_loader, axes, sched, device, use_amp, args.max_steps, conditioned, band, joint, args.slo_own_step, aligned)
         peak = torch.cuda.max_memory_allocated() / 2**30 if use_amp else float("nan")
         if conditioned:
             shown = "val mse %.6f (own SLO)  other SLO %.6f  no SLO %.6f" % (val["own"], val["other"], val["none"])
@@ -333,10 +376,13 @@ def main():
                 shown += "  OCT given a clean SLO: own %.6f  another scan's %.6f  SLO all noise %.6f" % (val["oct_clean_own"], val["oct_clean_other"], val["oct_slo_noise"])
         else:
             shown = "val mse %.6f" % val["none"]
+        if aligned:
+            shown = "align loss %.4f  %s  same place: own SLO %.3f  another scan's %.3f  whole scan: own %.3f  others %.3f  own SLO ranked first %d of %d" % (
+                total_align / steps, shown, val["near_own"], val["near_other"], val["whole_own"], val["whole_other"], val["top1"], val["n_whole"])
         print("epoch %d: train mse %.6f  %s  %.0f s  peak %.2f GiB  steps %d" % (epoch, total / steps, shown, time.time() - started, peak, steps), flush=True)
 
         path = os.path.join(args.out, "epoch_%04d.pt" % epoch)
-        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist(), "band_rms": None if rms is None else rms.tolist(), "band_power": args.band_scale, "slo_adapter": args.slo_adapter, "keep_slices": args.keep_slices, "z_down": list(args.z_down), "slo_tokens": args.slo_tokens, "slo_dim": args.slo_dim, "slo_xattn": sorted(set(args.slo_xattn)), "slo_slice": args.slo_slice, "slo_own_step": args.slo_own_step, "slo_clean": args.slo_clean, "slo_same": args.slo_same}
+        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist(), "band_rms": None if rms is None else rms.tolist(), "band_power": args.band_scale, "slo_adapter": args.slo_adapter, "keep_slices": args.keep_slices, "z_down": list(args.z_down), "slo_tokens": args.slo_tokens, "slo_dim": args.slo_dim, "slo_xattn": sorted(set(args.slo_xattn)), "slo_slice": args.slo_slice, "slo_own_step": args.slo_own_step, "slo_clean": args.slo_clean, "slo_same": args.slo_same, "slo_align": args.slo_align, "slo_align_loss": args.slo_align_loss}
         torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
         torch.save(state, latest + ".tmp")

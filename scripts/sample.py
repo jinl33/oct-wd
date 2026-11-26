@@ -113,12 +113,14 @@ def main():
     target = tuple(ckpt["target"])
     saved = options(ckpt)
     grid = wv.check_unet_grid(target, axes, saved["z_down"])
-    slo_size = ckpt.get("slo_size", 0)
+    slo_size = 0 if saved["align"] else ckpt.get("slo_size", 0)
     band = band_scale(ckpt)
     model.eval()
     joint = joint_parts(ckpt, axes)
     slo_text = "not used"
-    if slo_size:
+    if saved["align"]:
+        slo_text = "%d px, aligned encoder (%s), not fed to the denoiser" % (ckpt["slo_size"], saved["align_loss"])
+    elif slo_size:
         slo_text = "%d px" % slo_size + (", adapter" if saved["adapter"] else "") + (", cross-attention at levels %s" % " ".join(map(str, saved["xattn"])) if saved["xattn"] else "")
     elif joint:
         slo_text = "joint slice (%s)" % saved["slo_slice"] + (", own noise step" if saved["own_step"] else "")
@@ -238,7 +240,7 @@ def main():
         print("OCT en-face view against the SLO along the scan lines (correlation after high-pass, as in the alignment check):")
         correspondence("real", [scale(v) for v in real[:n_samples]], real_slo[:n_samples])
         correspondence("generated", made, made_slo)
-        print("similarity between different scans (mean correlation over pairs, after high-pass; real scans share almost nothing):")
+        print("similarity between different scans (mean correlation over pairs, after high-pass):")
         similarity("real", [scale(v) for v in real[:n_samples]], real_slo[:n_samples])
         similarity("generated", made, made_slo)
     from_slo = given if given else (made if slo_size else [])

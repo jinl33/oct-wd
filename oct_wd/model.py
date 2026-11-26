@@ -8,6 +8,11 @@ from oct_wd import wavelet as wv
 
 CONTEXT_DIM = 160
 Z_DOWN = (1, 1, 1, 1)
+ALIGN_LEVEL = 2
+ALIGN_STAGE = 2
+ALIGN_DIM = 128
+ALIGN_TEMP = 0.1
+JEPA_MOMENTUM = 0.996
 
 
 class ZUpsample(torch.nn.Module):
@@ -185,7 +190,7 @@ def pool(h, zparts=None, depth=None):
     return torch.cat([h[:, :, lo // f: -(-hi // f)].mean(dim=(2, 3, 4)) for lo, hi in zparts], dim=1)
 
 
-def encode(parts, base, x, timesteps, context=None, inject=None, zparts=None):
+def encode(parts, base, x, timesteps, context=None, inject=None, zparts=None, maps=None):
     emb = parts.time_embed(get_timestep_embedding(timesteps, base).to(dtype=x.dtype))
     if inject is not None:
         emb = inject.time(emb)
@@ -199,6 +204,8 @@ def encode(parts, base, x, timesteps, context=None, inject=None, zparts=None):
             h = inject(i + 1, h)
             res[-1] = h
         skips.extend(res)
+        if maps is not None:
+            maps.append(h)
         pooled.append(pool(h, zparts, x.shape[2]))
     h = parts.middle_block(hidden_states=h, temb=emb, context=context)
     pooled.append(pool(h, zparts, x.shape[2]))
@@ -258,6 +265,97 @@ class PartNoiseUNet(torch.nn.Module):
         return decode(self.unet, h, skips, emb)
 
 
+class AlignedDiffusion(torch.nn.Module):
+    def __init__(self, n_channels, z_down=Z_DOWN, dim=ALIGN_DIM):
+        super().__init__()
+        self.unet = build_unet(n_channels, None, z_down)
+        self.slo = SloEncoder()
+        ch = list(self.unet.block_out_channels)
+        self.oct_dense = torch.nn.Linear(ch[ALIGN_LEVEL - 1], dim)
+        self.slo_dense = torch.nn.Linear(self.slo.widths[ALIGN_STAGE], dim)
+        self.oct_whole = torch.nn.Linear(sum(ch) + ch[-1], dim)
+        self.slo_whole = torch.nn.Linear(self.slo.widths[-1], dim)
+
+    def forward(self, x, timesteps, slo=None):
+        return self.unet(x=x, timesteps=timesteps)
+
+    def embed(self, x0, slo):
+        if not isinstance(slo, (tuple, list)) or len(slo) != 2:
+            raise ValueError("the aligned model needs the SLO together with its scan-line grid")
+        image, grid = slo
+        maps = []
+        t0 = torch.zeros(x0.shape[0], dtype=torch.long, device=x0.device)
+        _, _, _, pooled = encode(self.unet, self.unet.block_out_channels[0], x0, t0, maps=maps)
+        h = maps[ALIGN_LEVEL - 1].mean(dim=3)
+        stages = self.slo.stages(image)
+        f = stages[ALIGN_STAGE]
+        xy = grid[:, :2].permute(0, 2, 3, 1).contiguous()
+        f = F.adaptive_avg_pool2d(F.grid_sample(f, xy.to(f.dtype), mode="bilinear", padding_mode="zeros", align_corners=False), h.shape[2:])
+        valid = F.adaptive_avg_pool2d(grid[:, 2:3].float(), h.shape[2:])[:, 0].flatten(1) > 0.999
+        o = self.oct_dense(h.flatten(2).transpose(1, 2))
+        v = self.slo_dense(f.flatten(2).transpose(1, 2))
+        go = self.oct_whole(torch.cat([p.float() for p in pooled], dim=1))
+        gs = self.slo_whole(stages[-1].mean(dim=(2, 3)))
+        return tuple(F.normalize(a.float(), dim=-1) for a in (o, v)) + (valid,) + tuple(F.normalize(a.float(), dim=-1) for a in (go, gs))
+
+    def match(self, x0, slo):
+        return self.embed(x0, slo)
+
+
+def predictor(dim):
+    return torch.nn.Sequential(torch.nn.Linear(dim, 2 * dim), torch.nn.GELU(), torch.nn.Linear(2 * dim, dim))
+
+
+def latent_distance(p, z):
+    return 2 - 2 * (F.normalize(p.float(), dim=-1) * z).sum(-1)
+
+
+class JepaAligned(AlignedDiffusion):
+    def __init__(self, n_channels, z_down=Z_DOWN, dim=ALIGN_DIM):
+        super().__init__(n_channels, z_down, dim)
+        target = AlignedDiffusion(n_channels, z_down, dim)
+        target.load_state_dict(self.state_dict())
+        for p in target.parameters():
+            p.requires_grad_(False)
+        self.oct_to_slo = predictor(dim)
+        self.slo_to_oct = predictor(dim)
+        self.whole_oct_to_slo = predictor(dim)
+        self.whole_slo_to_oct = predictor(dim)
+        self.target = target
+
+    def terms(self, x0, slo):
+        o, v, valid, go, gs = self.embed(x0, slo)
+        with torch.no_grad():
+            ot, vt, _, got, gst = self.target.embed(x0, slo)
+        dense = (latent_distance(self.oct_to_slo(o), vt)[valid].mean() + latent_distance(self.slo_to_oct(v), ot)[valid].mean()) / 2
+        whole = (latent_distance(self.whole_oct_to_slo(go), gst).mean() + latent_distance(self.whole_slo_to_oct(gs), got).mean()) / 2
+        return dense, whole
+
+    def match(self, x0, slo):
+        o, _, valid, go, _ = self.embed(x0, slo)
+        _, vt, _, _, gst = self.target.embed(x0, slo)
+        return F.normalize(self.oct_to_slo(o).float(), dim=-1), vt, valid, F.normalize(self.whole_oct_to_slo(go).float(), dim=-1), gst
+
+    @torch.no_grad()
+    def update_target(self, momentum=JEPA_MOMENTUM):
+        online = dict(self.named_parameters())
+        for name, p in self.target.named_parameters():
+            p.mul_(momentum).add_(online[name].detach().to(p.dtype), alpha=1 - momentum)
+
+
+def info_nce(a, b, temp=ALIGN_TEMP):
+    logits = a @ b.t() / temp
+    target = torch.arange(a.shape[0], device=a.device)
+    return (F.cross_entropy(logits, target) + F.cross_entropy(logits.t(), target)) / 2
+
+
+def align_loss(o, v, valid, go, gs, temp=ALIGN_TEMP):
+    m = valid.reshape(-1)
+    dense = info_nce(o.reshape(-1, o.shape[-1])[m], v.reshape(-1, v.shape[-1])[m], temp)
+    whole = info_nce(go, gs, temp) if go.shape[0] > 1 else dense.new_zeros(())
+    return dense, whole
+
+
 class SloDiffusion(torch.nn.Module):
     def __init__(self, n_channels, adapter=False, z_down=Z_DOWN, tokens=8, dim=CONTEXT_DIM, xattn=()):
         super().__init__()
@@ -282,9 +380,15 @@ class SloDiffusion(torch.nn.Module):
         return decode(self.unet, h, skips, emb, context)
 
 
-def build_model(n_channels, slo_size=0, adapter=False, z_down=Z_DOWN, tokens=8, dim=CONTEXT_DIM, xattn=(), part=None):
+def build_model(n_channels, slo_size=0, adapter=False, z_down=Z_DOWN, tokens=8, dim=CONTEXT_DIM, xattn=(), part=None, align=False, align_loss="contrastive"):
     if (adapter or xattn) and not slo_size:
         raise ValueError("the SLO adapter and SLO cross-attention need an SLO size")
+    if align:
+        if not slo_size or adapter or xattn or part is not None:
+            raise ValueError("the aligned model needs an SLO size and no SLO adapter, cross-attention or SLO slice")
+        if align_loss not in ("contrastive", "jepa"):
+            raise ValueError("unknown alignment loss %s" % align_loss)
+        return JepaAligned(n_channels, z_down) if align_loss == "jepa" else AlignedDiffusion(n_channels, z_down)
     if part is not None:
         if slo_size:
             raise ValueError("an own noise step for the SLO slice needs the joint model, without an SLO encoder")
@@ -314,11 +418,13 @@ class Encoder(torch.nn.Module):
     def __init__(self, model, slo_features=False, zparts=None):
         super().__init__()
         conditioned = isinstance(model, SloDiffusion)
-        if slo_features and not conditioned:
+        aligned = isinstance(model, AlignedDiffusion)
+        if slo_features and not (conditioned or aligned):
             raise ValueError("SLO features need a model with an SLO encoder")
         self.step = model.step if isinstance(model, PartNoiseUNet) else None
-        unet = model.unet if conditioned or self.step is not None else model
-        self.slo = model.slo if conditioned else None
+        self.conditions = conditioned
+        unet = model.unet if conditioned or aligned or self.step is not None else model
+        self.slo = model.slo if conditioned or aligned else None
         self.adapter = model.adapter if conditioned else None
         self.xattn = getattr(model, "xattn", None) if conditioned else None
         self.slo_features = slo_features
@@ -334,7 +440,7 @@ class Encoder(torch.nn.Module):
 
     def forward(self, x, t, slo=None):
         context, inject = None, None
-        if self.slo is not None:
+        if self.conditions:
             context, inject = condition(self.slo, self.adapter, slo, x.shape[0], None, self.xattn)
         if self.step is not None:
             x, inject = self.step.inputs(x, t)
@@ -347,13 +453,13 @@ class Encoder(torch.nn.Module):
 def options(ckpt):
     return {"adapter": bool(ckpt.get("slo_adapter", False)), "keep": int(ckpt.get("keep_slices", 0)), "z_down": tuple(ckpt.get("z_down", Z_DOWN)),
             "tokens": int(ckpt.get("slo_tokens", 8)), "dim": int(ckpt.get("slo_dim", CONTEXT_DIM)), "xattn": tuple(ckpt.get("slo_xattn", ())), "slo_slice": ckpt.get("slo_slice"),
-            "own_step": bool(ckpt.get("slo_own_step", False))}
+            "own_step": bool(ckpt.get("slo_own_step", False)), "align": float(ckpt.get("slo_align", 0.0)), "align_loss": ckpt.get("slo_align_loss", "contrastive")}
 
 
 def model_args(ckpt):
     opt = options(ckpt)
     part = joint_parts(ckpt, wv.DESIGNS[ckpt["design"]])[1] if opt["own_step"] else None
-    return dict(slo_size=ckpt.get("slo_size", 0), adapter=opt["adapter"], z_down=opt["z_down"], tokens=opt["tokens"], dim=opt["dim"], xattn=opt["xattn"], part=part)
+    return dict(slo_size=ckpt.get("slo_size", 0), adapter=opt["adapter"], z_down=opt["z_down"], tokens=opt["tokens"], dim=opt["dim"], xattn=opt["xattn"], part=part, align=opt["align"] > 0, align_loss=opt["align_loss"])
 
 
 def joint_parts(ckpt, axes):

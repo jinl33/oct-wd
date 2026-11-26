@@ -168,7 +168,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     print("task %s (%s), %s, encoder %s, design %s, SLO %s, band scaling %s, noise step %d, feature size %d, device %s" % (
         args.task, args.kind, args.mode, "random init" if args.random_init else "pretrained epoch %d" % ckpt["epoch"],
-        ckpt["design"], ("%d px" % slo_size + (", adapter" if saved["adapter"] else "") + (", cross-attention at levels %s" % " ".join(map(str, saved["xattn"])) if saved["xattn"] else "") + (", SLO features to the head" if args.slo_features else "")) if slo_size else ("joint slice (%s), pooled: %s" % (saved["slo_slice"], args.joint_pool) if saved["slo_slice"] else "not used"), "on" if band is not None else "off", args.t, enc.dim, device))
+        ckpt["design"], ("%d px" % slo_size + (", aligned encoder (%s)" % saved["align_loss"] if saved["align"] else "") + (", adapter" if saved["adapter"] else "") + (", cross-attention at levels %s" % " ".join(map(str, saved["xattn"])) if saved["xattn"] else "") + (", SLO features to the head" if args.slo_features else "")) if slo_size else ("joint slice (%s), pooled: %s" % (saved["slo_slice"], args.joint_pool) if saved["slo_slice"] else "not used"), "on" if band is not None else "off", args.t, enc.dim, device))
     print("encoder parameters: %d (decoder removed)" % sum(p.numel() for p in enc.parameters()))
 
     scans, _ = co.list_scans(args.root or co.default_root(), config["n_slices"])

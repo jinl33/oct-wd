@@ -222,6 +222,11 @@ On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs
     - Training log: `same place: own SLO A  another scan's B` (A clearly above B means OCT and SLO features match at each place), `own SLO ranked first N of 53` (chance 1), and the val mse against `w2z1_sqrt24` (same units; a rise means the alignment costs denoising).
     - `sample.py`: band table, intensity and images as for `w2z1_sqrt24` (the denoiser is OCT-only).
     - Heads: OCT and SLO features together. The eye task is easy from the SLO alone, so it checks the pipeline only; sex is the placeholder until retinal age arrives with the data pull.
+15. Second pretraining seed for the alignment result (2026-11-27). The retrieval (94 of 106) and the eye probe (0.97 from 37 labels, against 0.80) come from one pretraining run each. `jobs/lab_seed_runs.sh` trains `w2z1_align_s1` (weight 0.01) and `w2z1_sqrt24_s1` (the plain model, the run planned in step 10) with `--seed 1 --split-seed 42`, checks that both have `w2z1_sqrt24`'s split, then runs the eye probe at label fractions on both and the retrieval on `w2z1_align_s1`. If the split differs it stops before the heads. About 7 h in all (estimated: 2.6 h and 2.2 h of training, about 1 h of probes per run); `SEED=2` gives a third seed.
+
+        bash jobs/lab_run.sh seed1 jobs/lab_seed_runs.sh /data/oct_data/oct-runs
+
+    It replicates if `w2z1_align_s1` ranks most test scans' own SLO first place by place and its eye probe stays above `w2z1_sqrt24_s1`'s at every label count. The two seed-1 runs also give the seed-to-seed spread of the plain model, which step 10 asked for.
 
 `male` and `righteye` are the only labels the pilot has. They check that the heads run end to end. They are not research results. Matthias (2026-11-23): retinal age would be the next target, but the pilot has no ages, so sex stays the placeholder task until the data pull; the pilot is for setting up the pipeline, and the model is retrained once the 5,000 to 10,000 scans from the pull arrive.
 
@@ -434,9 +439,37 @@ Alignment runs, run plan step 14 (2026-11-26, typed back, 200 epochs each, 0 fai
   - `summarize_downstream.py` pooled results with and without `--slo-features` in one row (its 372-label rows read 0.973 and 0.702, the means of 0.961 and 0.985, and of 0.465 and 0.939). Fixed 2026-11-26: rows are now split by an `inputs` column (OCT, OCT+SLO, and the joint pool). Rerun it on any run that has both kinds of result.
 
 - **What this says.** Contrastive alignment gives OCT features that match the SLO at each place (training log) and, on one seed, an OCT-only eye probe at 0.96 to 0.98 from 37 labels on, against 0.80 to 0.90 for the plain model and the collapsed JEPA control, at the cost of 8% in denoising at step 50 and smoother samples. With SLO features the pilot labels cannot show a gain: the SLO shows the eye directly, and sex is at chance for every encoder. JEPA needs a guard against collapse (SIGReg or a variance term) before another run.
-- **OCT-to-SLO retrieval** (`scripts/retrieval.py`, built 2026-11-27, not run on real data yet). For each test scan, the same-place cosine between its OCT features and every scan's SLO features, averaged over the places both have, gives a 106 × 106 table; the whole-scan cosine gives a second one. Reported both ways (OCT finds its SLO, SLO finds its OCT): how many scans rank their own partner first and in the top 5 (chance: 1 and 5), the median and mean rank (chance 53.5), and a one-sided p-value for the mean rank from 10,000 random pairings. It also prints the same-place cosine with the scan's own SLO at the place turned 180 degrees: if that is as high as at the right place, the link is to the scan as a whole rather than to each place. Numbers only, saved to `retrieval/retrieval_test.json` in each run folder. All three aligned runs, a few minutes in all (estimated):
+- **OCT-to-SLO retrieval** (`scripts/retrieval.py`, built and run 2026-11-27). For each test scan, the same-place cosine between its OCT features and every scan's SLO features, averaged over the places both have, gives a 106 × 106 table; the whole-scan cosine gives a second one. Reported both ways (OCT finds its SLO, SLO finds its OCT): how many scans rank their own partner first and in the top 5 (chance: 1 and 5), the median and mean rank (chance 53.5), and a one-sided p-value for the mean rank from 10,000 random pairings. It also prints the same-place cosine with the scan's own SLO at the place turned 180 degrees: if that is as high as at the right place, the link is to the scan as a whole rather than to each place. Numbers only, saved to `retrieval/retrieval_test.json` in each run folder. All three aligned runs, a few minutes in all (estimated):
 
       bash jobs/lab_run.sh retrieval scripts/retrieval.py --run /data/oct_data/oct-runs/w2z1_align /data/oct_data/oct-runs/w2z1_align_strong /data/oct_data/oct-runs/w2z1_align_jepa
+
+  `w2z1_align` on the 106 test scans (2026-11-27, typed back; 384 places per scan):
+
+  | Measure | Direction | Ranked first | In top 5 | Median rank | Mean rank | p |
+  |---|---|---|---|---|---|---|
+  | Same place | OCT finds its SLO | 94 | 100 | 1 | 2.4 | 0.0001 |
+  | Same place | SLO finds its OCT | 101 | 104 | 1 | 1.7 | 0.0001 |
+  | Whole scan | OCT finds its SLO | 6 | 28 | 16 | 24.1 | 0.0001 |
+  | Whole scan | SLO finds its OCT | 7 | 22 | 21.5 | 26.1 | 0.0001 |
+
+  Chance: 1 ranked first, 5 in the top 5, median rank 53.5. A p of 0.0001 is the smallest the 10,000 pairings can give. Same-place cosine: own SLO 0.542, own SLO at the place turned 180 degrees 0.053, another scan's SLO at the same place 0.125. Whole-scan cosine: own 0.135, others -0.058.
+  - **Place by place, the OCT encoder identifies its own SLO** in 94 of 106 scans it never saw in training, and the SLO finds its OCT in 101. Matthias's multimodal criterion is met in this sense: features computed from the OCT alone carry what the SLO shows at each place.
+  - **The link is to each place, not to the scan as a whole.** The scan's own SLO at the wrong place (0.053) scores below another scan's SLO at the right place (0.125). Anything global (brightness, eye side, the session's settings) would survive the 180-degree turn, so it does not explain the match. The likely shared content is the vessel pattern, which shows in the OCT as vessel shadows (inferred).
+  - **Whole-scan matching stays weak** (6 of 106 first, mean rank 24 against 53.5), as in training and in the literature.
+  - **Not comparable with published retrieval numbers** (OCTCube-M OCT-to-IR top-1 0.64, Sükei about 0.1): the same-place measure uses the scanner's record of where each B-scan lies on the SLO, which whole-image retrieval does not have, and the pool here is 106 scans. Every Spectralis scan comes with that record, so the measure is fair for our data.
+  - One pretraining seed.
+
+  `w2z1_align_strong` and the `w2z1_align_jepa` control on the same 106 test scans (2026-11-27, typed back). Ranked first / in top 5 / mean rank:
+
+  | Run | Same place, OCT finds SLO | Same place, SLO finds OCT | Whole scan, OCT finds SLO | Whole scan, SLO finds OCT | Same-place cosine: own / own turned 180 degrees / other scans |
+  |---|---|---|---|---|---|
+  | `w2z1_align` (0.01) | 94 / 100 / 2.4 | 101 / 104 / 1.7 | 6 / 28 / 24.1 | 7 / 22 / 26.1 | 0.542 / 0.053 / 0.125 |
+  | `w2z1_align_strong` (0.1) | 94 / 98 / 2.2 | 98 / 105 / 1.4 | 7 / 25 / 22.3 | 6 / 30 / 23.0 | 0.536 / 0.039 / 0.116 |
+  | `w2z1_align_jepa` (collapsed) | 1 / 8 / 48.1 | 5 / 19 / 36.7 | 1 / 10 / 47.3 | 2 / 11 / 42.4 | 0.997 / 0.995 / 0.997 |
+
+  - **Weight 0.1 gives the same place-by-place retrieval as 0.01** and slightly better whole-scan matching (whole-scan cosine 0.237 against 0.135), at 2.5 times the denoising cost. 0.01 stays the setting.
+  - **The JEPA control is close to chance but not at it:** 1 to 5 of 106 ranked first, mean ranks 37 to 48 against 53.5 (p 0.0001 to 0.0002). Its cosines are 0.995 to 1.000 for every pair, so the ranking picks up the small variation left after collapse. That remainder may come from the epochs before collapse or from whole-scan factors such as brightness (inferred). The rotated-place control rules such factors out as the cause of the contrastive runs' 94 of 106.
+  - **Checked: nothing in the evaluation favours a scan's own pair.** The SLO encoder and the U-Net use GroupNorm, which normalises each scan on its own, so scans in the same batch do not share statistics; the OCT and the SLO are only compared after both are embedded.
 
 Heads on the 106 test scans: AUROC with 95% CI.
 

@@ -44,6 +44,7 @@ Lab computer, in the background with a log in `~/oct-logs`:
 | `bash jobs/lab_run.sh NAME scripts/scan_report.py --run RUN` | Each validation and test scan noised to steps 50, 200 and 500 and restored in one model call: PSNR, SSIM and the noisy input's PSNR, split by cohort columns (`--group`, default `male righteye`). Writes plots, a per-scan table without IDs, and views of the lowest-PSNR scans to `RUN/scan_report` | Yes |
 | `python scripts/summarize_downstream.py --run RUN [RUN ...]` | One table of every head result in a run: mean, min and max over subsets, split by inputs (OCT, or OCT and SLO features) | No, reads `results.json` only |
 | `bash jobs/lab_run.sh NAME scripts/retrieval.py --run RUN [RUN ...]` | Aligned runs only (`--slo-align`): on the test scans (`--part val` for validation), how well each OCT finds its own SLO among all of them and back, by the same-place cosine averaged over each scan and by the whole-scan cosine: top-1, top-5, median and mean rank, and a p-value from random pairings. Also the same-place cosine with the own SLO at the place turned 180 degrees. Numbers only, in `retrieval/retrieval_test.json` | Yes |
+| `bash jobs/lab_run.sh NAME jobs/lab_seed_runs.sh RUNS_FOLDER` | Second pretraining seed (`SEED`, default 1, split seed 42): trains `w2z1_align_s1` and `w2z1_sqrt24_s1`, checks their split against `w2z1_sqrt24`'s, then the eye probe at label fractions on both and the retrieval on the aligned run | Yes |
 
 QC images and checkpoints stay on Armis2. Printed logs hold counts and losses only, but read them before sharing.
 

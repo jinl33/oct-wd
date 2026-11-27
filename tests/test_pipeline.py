@@ -1118,6 +1118,17 @@ def test_slo_runs(root, tmp):
         code, out = run("scripts/downstream.py", "--run", je_run, "--root", root, "--task", "righteye", "--workers", "0", "--n-boot", "50", *extra)
         assert code == 0 and "aligned encoder (jepa)" in out and "feature size %d" % size in out and "test auroc" in out, out
         no_leak(out, "downstream on the JEPA-aligned model")
+    code, out = run("scripts/retrieval.py", "--run", al_run, je_run, "--root", root, "--workers", "0", "--n-perm", "50")
+    assert code == 0 and "aligned encoder (contrastive)" in out and "aligned encoder (jepa)" in out and out.count("retrieval among") == 2 and "same place  OCT to SLO" in out and "whole scan  SLO to OCT" in out, out
+    no_leak(out, "retrieval on the aligned models")
+    print(out)
+    with open(os.path.join(al_run, "retrieval", "retrieval_test.json")) as f:
+        res = json.load(f)
+    assert res["scans"] >= 2 and len(res["retrieval"]) == 4 and all(1 <= r["mean_rank"] <= res["scans"] and 0 < r["p"] <= 1 for r in res["retrieval"].values()), res
+    code, out = run("scripts/retrieval.py", "--run", al_run, "--root", root, "--workers", "0", "--n-perm", "50", "--part", "val")
+    assert code == 0 and "val scans" in out, out
+    code, out = run("scripts/retrieval.py", "--run", step, "--root", root, "--workers", "0")
+    assert code != 0 and "is not an aligned model" in out, out
 
 
 def main():

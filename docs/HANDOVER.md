@@ -239,6 +239,11 @@ On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs
     - Retrieval: whether own SLO is ranked first place by place (`w2z1_align` 94 of 106, the collapsed run 1), and the turned-place control: if the own SLO at the turned place scores as high as at the right place, the features code the place, not the scan.
     - Eye probe at label fractions against `w2z1_align` (0.97 from 37 labels), `w2z1_align_jepa` (0.84) and `w2z1_sqrt24` (0.80).
 
+    A third pretraining seed (step 15 with `SEED=2`, about 7 h, estimated) can be queued to start when this job ends:
+
+        cd ~/oct-wd
+        SEED=2 bash jobs/lab_after.sh lab_jepa_sigreg.sh seed2 jobs/lab_seed_runs.sh /data/oct_data/oct-runs
+
 `male` and `righteye` are the only labels the pilot has. They check that the heads run end to end. They are not research results. Matthias (2026-11-23): retinal age would be the next target, but the pilot has no ages, so sex stays the placeholder task until the data pull; the pilot is for setting up the pipeline, and the model is retrained once the 5,000 to 10,000 scans from the pull arrive.
 
 ### Reading the logs

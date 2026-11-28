@@ -45,6 +45,7 @@ Lab computer, in the background with a log in `~/oct-logs`:
 | `python scripts/summarize_downstream.py --run RUN [RUN ...]` | One table of every head result in a run: mean, min and max over subsets, split by inputs (OCT, or OCT and SLO features) | No, reads `results.json` only |
 | `bash jobs/lab_run.sh NAME scripts/retrieval.py --run RUN [RUN ...]` | Aligned runs only (`--slo-align`): on the test scans (`--part val` for validation), how well each OCT finds its own SLO among all of them and back, by the same-place cosine averaged over each scan and by the whole-scan cosine: top-1, top-5, median and mean rank, and a p-value from random pairings. Also the same-place cosine with the own SLO at the place turned 180 degrees. Numbers only, in `retrieval/retrieval_test.json` | Yes |
 | `bash jobs/lab_run.sh NAME jobs/lab_seed_runs.sh RUNS_FOLDER` | Second pretraining seed (`SEED`, default 1, split seed 42): trains `w2z1_align_s1` and `w2z1_sqrt24_s1`, checks their split against `w2z1_sqrt24`'s, then the eye probe at label fractions on both and the retrieval on the aligned run | Yes |
+| `bash jobs/lab_run.sh NAME jobs/lab_jepa_sigreg.sh RUNS_FOLDER` | `w2z1_align_jepa_sigreg`: the JEPA-aligned model with LeJEPA's SIGReg against collapse (`--slo-sigreg 0.05`), otherwise as `w2z1_align_jepa`; checks its split against `w2z1_sqrt24`'s, then the eye probe at label fractions and the retrieval. `EPOCHS` | Yes |
 
 QC images and checkpoints stay on Armis2. Printed logs hold counts and losses only, but read them before sharing.
 
@@ -57,7 +58,7 @@ On a lab computer, from the repo folder, with `OCT_ROOT` in `~/.oct_paths` point
 
        bash jobs/lab_run.sh pretrain scripts/train.py --out RUNS/w2z1_sqrt24 --design w2z1 --band-scale 0.5 --batch-size 4 --epochs 200 --auto-resume --keep-slices 24 --target 24 512 512 --z-down 0 0 1 1
 
-   Add `--slo-size 256 --slo-tokens 16 --slo-xattn 0 1 2` for the SLO model, or `--slo-slice raster --target 32 512 512` for the joint model (add `--slo-own-step` to give the SLO its own noise step), or `--slo-size 256 --slo-align 0.01` for a separate SLO encoder aligned with the OCT encoder. Restart the same command after a stop.
+   Add `--slo-size 256 --slo-tokens 16 --slo-xattn 0 1 2` for the SLO model, or `--slo-slice raster --target 32 512 512` for the joint model (add `--slo-own-step` to give the SLO its own noise step), or `--slo-size 256 --slo-align 0.01` for a separate SLO encoder aligned with the OCT encoder (add `--slo-align-loss jepa` for JEPA-style prediction, and `--slo-sigreg 0.05` to guard it against collapse). Restart the same command after a stop.
 4. `bash jobs/lab_run.sh eval jobs/lab_evaluate.sh RUNS/w2z1_sqrt24`: generated samples and their numbers, then probe and finetune heads for each task in `TASKS`, pretrained and from random init.
 5. Heads for a new label: any cohort column, `--task COLUMN` with `--kind binary` (0/1) or `--kind regression` (for example age). `jobs/lab_label_fraction.sh` repeats them on 10 to 100% of the labels.
 

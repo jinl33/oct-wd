@@ -72,6 +72,7 @@ Keep the scans on the Turbo mount rather than copying them. That leaves one copy
    - **Whole scan:** the pooled OCT features (560 numbers) against the pooled SLO features, so SLO content outside the scan area (optic disc) also counts.
    Both go through a linear projection to 128 numbers. The total loss is the diffusion MSE plus WEIGHT times the mean of the two contrastive terms. The SLO encoder and the projections learn from the contrastive term alone, so with Adam their speed does not depend on WEIGHT; WEIGHT sets how much the contrastive term reshapes the OCT encoder against the denoising loss. Validation reports, besides the diffusion loss, the cosine at the same place with the scan's own SLO and with another scan's, the whole-scan cosine with its own SLO and with the others, and how many validation scans rank their own SLO first among all of them (chance: 1). For downstream, `--slo-features` adds the SLO encoder's pooled features to the OCT features (720 numbers).
    - `--slo-align-loss jepa` swaps the contrastive loss for JEPA-style latent prediction (Matthias's JEPA question from 2026-11-04, here across modalities). The same features are used, but there are no negatives. A small predictor per direction (OCT to SLO, SLO to OCT, at the same place and over the whole scan) predicts the other modality's projected features, taken from slowly updated copies of both encoders (EMA, momentum 0.996, updated after each optimizer step, no gradient), as in I-JEPA and BYOL. The loss is 2 - 2 x cosine. The diffusion loss still trains the denoiser on the OCT. The EMA copies are kept in the checkpoint; the heads use the trained encoders. In validation, the cosines and the ranking compare the OCT's prediction with the SLO target.
+   - `--slo-sigreg LAMBDA` (with `jepa`, 2026-11-27) adds SIGReg from LeJEPA (Balestriero and LeCun, arXiv 2511.08544) against the collapse seen in `w2z1_align_jepa`. SIGReg tests whether the embeddings look like samples from a standard Gaussian: it projects them onto 256 random directions, drawn new each step, and compares each projection's empirical characteristic function with the Gaussian one at 17 points from -5 to 5 (the Epps-Pulley statistic, times the number of samples, averaged over directions). The alignment term becomes (1 - LAMBDA) x the prediction loss + LAMBDA x SIGReg; LeJEPA's default LAMBDA is 0.05. Differences from LeJEPA: the EMA targets and predictors stay, so the only change from `w2z1_align_jepa` is the added term; SIGReg is applied to the same-place features of both modalities (all valid cells of the batch, about 1,500 per step), not to the whole-scan features (4 per batch is too few); and because the projections are unit length, they are scaled by the square root of 128 first (unit vectors scaled this way pass as Gaussian, measured 1.0 against 0.9 for a true Gaussian and 1,800 for a collapsed set, on random data). Two limits, measured on random data: the OCT place features come from 40 channels, so they cannot fill 128 dimensions and their SIGReg bottoms out near 10 rather than 1 (the logged value, the mean over both modalities, cannot go much below about 5); and a code that depends on the place but is the same in every scan scores only about 4, so SIGReg stops full collapse but not that one. The retrieval's turned-place control would show it.
 9. **Downstream.** `scripts/downstream.py` keeps the input layer, encoder and bottleneck, drops the decoder, and pools each level into a 560-number feature vector. Then either:
    - `probe`: frozen encoder plus a linear head. Weight decay is chosen on validation.
    - `finetune`: encoder plus head trained together. The epoch is chosen on validation.
@@ -227,6 +228,16 @@ On the RTX 5090, write runs to `/data/UNIQNAME/oct-runs` rather than `~/oct-runs
         bash jobs/lab_run.sh seed1 jobs/lab_seed_runs.sh /data/oct_data/oct-runs
 
     It replicates if `w2z1_align_s1` ranks most test scans' own SLO first place by place and its eye probe stays above `w2z1_sqrt24_s1`'s at every label count. The two seed-1 runs also give the seed-to-seed spread of the plain model, which step 10 asked for.
+
+    Done 2026-11-27, 0 failed steps: both results replicate (under the alignment runs). `w2z1_sqrt24_s1` already had 200 epochs from step 10, so the job loaded it and did not retrain it.
+16. JEPA with SIGReg against collapse (2026-11-27; Matthias's JEPA question from 2026-11-04). `w2z1_align_jepa` collapsed by epoch 5, so it could not answer whether prediction without negatives aligns OCT and SLO. `jobs/lab_jepa_sigreg.sh` trains `w2z1_align_jepa_sigreg`, the same run with `--slo-sigreg 0.05` (pipeline step 8b), checks its split against `w2z1_sqrt24`'s, then runs the eye probe at label fractions and the retrieval. About 4 h (estimated: 3 h of training at about 53 s per epoch, as `w2z1_align_jepa`, plus the probes). Pull the code first:
+
+        bash jobs/lab_run.sh sigreg jobs/lab_jepa_sigreg.sh /data/oct_data/oct-runs
+
+    What to read:
+    - Training log: `align loss A (SIGReg S)` and `same place: own SLO X  another scan's Y`. Collapse shows as X and Y both near 1, as in `w2z1_align_jepa` (0.998 and 0.998). S in the single digits or low tens means the place features are spread out (about 5 is the floor on random data); S in the hundreds or more means they are bunched together.
+    - Retrieval: whether own SLO is ranked first place by place (`w2z1_align` 94 of 106, the collapsed run 1), and the turned-place control: if the own SLO at the turned place scores as high as at the right place, the features code the place, not the scan.
+    - Eye probe at label fractions against `w2z1_align` (0.97 from 37 labels), `w2z1_align_jepa` (0.84) and `w2z1_sqrt24` (0.80).
 
 `male` and `righteye` are the only labels the pilot has. They check that the heads run end to end. They are not research results. Matthias (2026-11-23): retinal age would be the next target, but the pilot has no ages, so sex stays the placeholder task until the data pull; the pilot is for setting up the pipeline, and the model is retrained once the 5,000 to 10,000 scans from the pull arrive.
 
@@ -396,6 +407,7 @@ Alignment runs, run plan step 14 (2026-11-26, typed back, 200 epochs each, 0 fai
 | `w2z1_align` | 0.01, contrastive | 0.514 / 0.146 | 0.136 / -0.018 | 4.4 | 0.02165 (+1.6%) | 11.41 GiB, 47 s, 20,595,216 |
 | `w2z1_align_strong` | 0.1, contrastive | 0.515 / 0.126 | about 0.16 / -0.01 | 5.0 | 0.02218 (+4%) | 11.41 GiB, 47 s, 20,595,216 |
 | `w2z1_align_jepa` | 0.01, JEPA-style | 0.998 / 0.998 | 1.000 / 1.000 | about 1 | 0.02136 (same) | 12.02 GiB, 53 s, 41,454,112 (with the EMA copies) |
+| `w2z1_align_s1` (seed 1, step 15) | 0.01, contrastive | 0.489 / 0.133 | 0.165 / -0.007 | 3.3 | 0.02163 (+1.5%) | 11.41 GiB, 47 s, 20,595,216 |
 
 - **Contrastive alignment works at each place along the scan lines.** The cosine with the scan's own SLO rose steadily from 0 to about 0.51, against about 0.15 for another scan's SLO at the same place (the 0.15 is anatomy all scans share, as the 0.37 en-face similarity between real scans). The gap was still growing at epoch 200 (align loss 4.34 to 1.99). This is the first SLO design in which the OCT features carry scan-specific information that matches the SLO.
 - **Whole-scan matching is weak**, as expected from the literature (Sükei et al., about 0.1 top-1 at 153k pairs): own SLO ranked first for 2 to 9 of 53 validation scans (chance 1).
@@ -428,17 +440,17 @@ Alignment runs, run plan step 14 (2026-11-26, typed back, 200 epochs each, 0 fai
   | Training scans with labels | `w2z1_align` pretrained | `w2z1_align_jepa` pretrained (control) | `w2z1_sqrt24` pretrained | Random init (all three) |
   |---|---|---|---|---|
   | 37 (10%) | 0.974 (0.958–0.983) | 0.839 (0.765–0.903) | 0.803 (0.703–0.885) | 0.491 (0.392–0.559) |
-  | 93 (25%) | 0.977 (0.961–0.986) | running (subset 0: 0.891) | 0.869 (0.848–0.922) | 0.501 (0.410–0.589) |
-  | 186 (50%) | 0.971 (0.957–0.983) | running | 0.880 (0.857–0.901) | 0.500 (0.477–0.542) |
-  | 372 (100%) | 0.961 (CI 0.915–0.995) | running | 0.897 (CI 0.826–0.952) | 0.465 |
+  | 93 (25%) | 0.977 (0.961–0.986) | 0.875 (0.850–0.909) | 0.869 (0.848–0.922) | 0.501 (0.410–0.589) |
+  | 186 (50%) | 0.971 (0.957–0.983) | 0.878 (0.865–0.893) | 0.880 (0.857–0.901) | 0.500 (0.477–0.542) |
+  | 372 (100%) | 0.961 (CI 0.915–0.995) | 0.887 (CI 0.814–0.942) | 0.897 (CI 0.826–0.952) | 0.465 |
 
   - **The gain holds at every label count.** At 37, 93 and 186 labels the lowest `w2z1_align` subset is above the highest `w2z1_sqrt24` subset. With 37 labels the aligned encoder is already at its best; more labels do not raise it.
   - **Same split and subsets:** the random-init numbers are identical to `w2z1_sqrt24`'s, digit for digit, so the test set and subsets are the same.
-  - **Control:** the collapsed JEPA run, with the same SLO encoder, data loading and training length, scores 0.839 (0.765–0.903) at 37 labels: within `w2z1_sqrt24`'s range (0.703–0.885 overlaps) and below every `w2z1_align` subset. So the gain comes from the contrastive alignment, not from the rest of the aligned setup (93 to 372 labels still running).
+  - **Control:** the collapsed JEPA run, with the same SLO encoder, data loading and training length, is level with `w2z1_sqrt24` at every label count (0.839, 0.875, 0.878 and 0.887 against 0.803, 0.869, 0.880 and 0.897, ranges overlapping) and below every `w2z1_align` subset. So the whole gain comes from the contrastive alignment, not from the rest of the aligned setup.
   - **What it does and does not show:** the SLO is not an input at test time, so the OCT encoder learned this from being matched to the SLO along the scan lines. Eye side is what the SLO shows most directly (the optic disc), so this task favours alignment. It shows that SLO information reached the OCT features, not that they are better for age or disease.
-  - `summarize_downstream.py` pooled results with and without `--slo-features` in one row (its 372-label rows read 0.973 and 0.702, the means of 0.961 and 0.985, and of 0.465 and 0.939). Fixed 2026-11-26: rows are now split by an `inputs` column (OCT, OCT+SLO, and the joint pool). Rerun it on any run that has both kinds of result.
+  - `summarize_downstream.py` pooled results with and without `--slo-features` in one row (its 372-label rows read 0.973 and 0.702, the means of 0.961 and 0.985, and of 0.465 and 0.939). Fixed 2026-11-26: rows are now split by an `inputs` column (OCT, OCT+SLO, and the joint pool). Rerun it on any run that has both kinds of result. The fixed version produced the `w2z1_align_jepa` summary of `frac_align` (pulled while the job ran), with OCT and OCT+SLO rows apart.
 
-- **What this says.** Contrastive alignment gives OCT features that match the SLO at each place (training log) and, on one seed, an OCT-only eye probe at 0.96 to 0.98 from 37 labels on, against 0.80 to 0.90 for the plain model and the collapsed JEPA control, at the cost of 8% in denoising at step 50 and smoother samples. With SLO features the pilot labels cannot show a gain: the SLO shows the eye directly, and sex is at chance for every encoder. JEPA needs a guard against collapse (SIGReg or a variance term) before another run.
+- **What this says.** Contrastive alignment gives OCT features that match the SLO at each place (training log) and, on two pretraining seeds, an OCT-only eye probe at 0.95 to 0.98 from 37 labels on, against 0.77 to 0.90 for the plain model (and 0.84 to 0.89 for the collapsed JEPA control, one seed), at the cost of 8% in denoising at step 50 and smoother samples. With SLO features the pilot labels cannot show a gain: the SLO shows the eye directly, and sex is at chance for every encoder. JEPA needs a guard against collapse (SIGReg or a variance term) before another run; built 2026-11-27 as `--slo-sigreg` (run plan step 16).
 - **OCT-to-SLO retrieval** (`scripts/retrieval.py`, built and run 2026-11-27). For each test scan, the same-place cosine between its OCT features and every scan's SLO features, averaged over the places both have, gives a 106 × 106 table; the whole-scan cosine gives a second one. Reported both ways (OCT finds its SLO, SLO finds its OCT): how many scans rank their own partner first and in the top 5 (chance: 1 and 5), the median and mean rank (chance 53.5), and a one-sided p-value for the mean rank from 10,000 random pairings. It also prints the same-place cosine with the scan's own SLO at the place turned 180 degrees: if that is as high as at the right place, the link is to the scan as a whole rather than to each place. Numbers only, saved to `retrieval/retrieval_test.json` in each run folder. All three aligned runs, a few minutes in all (estimated):
 
       bash jobs/lab_run.sh retrieval scripts/retrieval.py --run /data/oct_data/oct-runs/w2z1_align /data/oct_data/oct-runs/w2z1_align_strong /data/oct_data/oct-runs/w2z1_align_jepa
@@ -457,7 +469,7 @@ Alignment runs, run plan step 14 (2026-11-26, typed back, 200 epochs each, 0 fai
   - **The link is to each place, not to the scan as a whole.** The scan's own SLO at the wrong place (0.053) scores below another scan's SLO at the right place (0.125). Anything global (brightness, eye side, the session's settings) would survive the 180-degree turn, so it does not explain the match. The likely shared content is the vessel pattern, which shows in the OCT as vessel shadows (inferred).
   - **Whole-scan matching stays weak** (6 of 106 first, mean rank 24 against 53.5), as in training and in the literature.
   - **Not comparable with published retrieval numbers** (OCTCube-M OCT-to-IR top-1 0.64, Sükei about 0.1): the same-place measure uses the scanner's record of where each B-scan lies on the SLO, which whole-image retrieval does not have, and the pool here is 106 scans. Every Spectralis scan comes with that record, so the measure is fair for our data.
-  - One pretraining seed.
+  - Replicated on a second pretraining seed (below).
 
   `w2z1_align_strong` and the `w2z1_align_jepa` control on the same 106 test scans (2026-11-27, typed back). Ranked first / in top 5 / mean rank:
 
@@ -470,6 +482,32 @@ Alignment runs, run plan step 14 (2026-11-26, typed back, 200 epochs each, 0 fai
   - **Weight 0.1 gives the same place-by-place retrieval as 0.01** and slightly better whole-scan matching (whole-scan cosine 0.237 against 0.135), at 2.5 times the denoising cost. 0.01 stays the setting.
   - **The JEPA control is close to chance but not at it:** 1 to 5 of 106 ranked first, mean ranks 37 to 48 against 53.5 (p 0.0001 to 0.0002). Its cosines are 0.995 to 1.000 for every pair, so the ranking picks up the small variation left after collapse. That remainder may come from the epochs before collapse or from whole-scan factors such as brightness (inferred). The rotated-place control rules such factors out as the cause of the contrastive runs' 94 of 106.
   - **Checked: nothing in the evaluation favours a scan's own pair.** The SLO encoder and the U-Net use GroupNorm, which normalises each scan on its own, so scans in the same batch do not share statistics; the OCT and the SLO are only compared after both are embedded.
+
+  Second pretraining seed (run plan step 15, 2026-11-27, typed back, log `seed1`, 0 failed steps). `w2z1_align_s1` trained 200 epochs from the start with `--seed 1 --split-seed 42`. `w2z1_sqrt24_s1` already had 200 epochs from run plan step 10, so the job loaded it (`resumed after epoch 200`) and did not retrain it; its `config.json` shows seed 1, split seed 42, 200 epochs and 24 slices kept (typed back 2026-11-27; the resume check compares the design and flags but not the seed). Both have `w2z1_sqrt24`'s split, and the random-init probe numbers are the seed-42 ones digit for digit, so the test set and subsets are the same.
+
+  Eye probe, OCT features only, test AUROC mean (min to max) over the same five subsets:
+
+  | Training scans with labels | `w2z1_align_s1` | `w2z1_sqrt24_s1` | Gap, seed 1 | Gap, seed 42 |
+  |---|---|---|---|---|
+  | 37 (10%) | 0.947 (0.920–0.967) | 0.774 (0.717–0.813) | 0.173 | 0.171 |
+  | 93 (25%) | 0.962 (0.956–0.973) | 0.854 (0.825–0.876) | 0.108 | 0.108 |
+  | 186 (50%) | 0.961 (0.952–0.967) | 0.886 (0.861–0.901) | 0.076 | 0.091 |
+  | 372 (100%) | 0.966 (CI 0.930–0.991) | 0.890 (CI 0.815–0.949) | 0.076 | 0.064 |
+
+  - **The eye-probe gain replicates.** Every `w2z1_align_s1` subset (lowest 0.920) is above every `w2z1_sqrt24_s1` subset at any label count (highest 0.901). On each of the 15 subsets both runs share, the aligned encoder is ahead by 0.06 to 0.23. The gap at each label count is within 0.015 of seed 42's.
+  - **Seed-to-seed spread** (step 10's question): between seeds the plain model moves by 0.006 to 0.029 and the aligned one by 0.005 to 0.027, both lowest at 37 labels on seed 1. The gap between the two (0.06 to 0.17) is several times that.
+
+  Retrieval on the 106 test scans, ranked first / in top 5 / mean rank (all p 0.0001, the floor):
+
+  | Run | Same place, OCT finds SLO | Same place, SLO finds OCT | Whole scan, OCT finds SLO | Whole scan, SLO finds OCT | Same-place cosine: own / own turned 180 degrees / other scans | Whole-scan cosine: own / others |
+  |---|---|---|---|---|---|---|
+  | `w2z1_align` (seed 42) | 94 / 100 / 2.4 | 101 / 104 / 1.7 | 6 / 28 / 24.1 | 7 / 22 / 26.1 | 0.542 / 0.053 / 0.125 | 0.135 / -0.058 |
+  | `w2z1_align_s1` | 89 / 95 / 3.2 | 100 / 102 / 2.7 | 6 / 28 / 24.6 | 5 / 21 / 25.2 | 0.503 / 0.040 / 0.111 | 0.174 / -0.029 |
+
+  - **Retrieval replicates:** place by place, 89 of 106 OCTs rank their own SLO first (seed 42: 94) and 100 of 106 SLOs their own OCT (101). The scan's own SLO at the turned place again scores below another scan's SLO at the right place (0.040 against 0.111), so the link is again to each place.
+  - **Seed 1 is a little less aligned place by place:** align loss 2.15 at epoch 200 (seed 42: 1.99), same-place cosine 0.503 (0.542), 89 against 94 ranked first, eye probe 0.947 against 0.974 at 37 labels. Whole-scan matching is level (6 first in both; whole-scan cosine 0.174 against 0.135). In both seeds the alignment was still rising at epoch 200, so the smaller numbers fit an alignment that got less far in the same 200 epochs rather than a different result (inferred).
+  - **Same denoising cost:** val mse 0.02163 over epochs 191 to 200 (seed 42: 0.02165; `w2z1_sqrt24`: 0.0213).
+  - The JEPA control and `w2z1_align_strong` are one seed each. `SEED=2 bash jobs/lab_run.sh seed2 jobs/lab_seed_runs.sh /data/oct_data/oct-runs` gives a third seed.
 
 Heads on the 106 test scans: AUROC with 95% CI.
 

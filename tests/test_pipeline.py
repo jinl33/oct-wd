@@ -916,8 +916,8 @@ def test_slo_parts(root):
     assert isinstance(jep, mo.JepaAligned) and not any(p.requires_grad for p in jep.target.parameters())
     online = jep.state_dict()
     assert all(torch.equal(v, online[k]) for k, v in jep.target.state_dict().items()), "the target encoders must start as copies"
-    dense, whole = jep.terms(xa, (simg, sgrid))
-    assert torch.isfinite(dense) and torch.isfinite(whole) and dense > 0 and whole > 0
+    dense, whole, reg = jep.terms(xa, (simg, sgrid))
+    assert torch.isfinite(dense) and torch.isfinite(whole) and dense > 0 and whole > 0 and reg == 0
     (dense + whole).backward()
     assert jep.oct_to_slo[0].weight.grad is not None and jep.slo.body[0].weight.grad is not None and jep.unet.conv_in.conv.weight.grad is not None
     assert all(p.grad is None for p in jep.target.parameters()), "the targets must get no gradient"
@@ -933,6 +933,22 @@ def test_slo_parts(root):
     assert not any(n.startswith("target.") for n, _ in mo.Encoder(jep, slo_features=True).named_parameters())
     assert fails(lambda: mo.build_model(32, 64, align=True, align_loss="mae")).startswith("unknown alignment loss")
     assert mo.model_args({"design": "w2z1", "slo_size": 64, "slo_align": 0.1, "slo_align_loss": "jepa"})["align_loss"] == "jepa"
+    torch.manual_seed(0)
+    gauss, flat = torch.randn(512, 32), torch.ones(512, 32)
+    assert mo.sigreg(gauss) < 3 and mo.sigreg(flat) > 100 * mo.sigreg(gauss), "SIGReg must be small for a standard Gaussian and large for a collapsed set"
+    sph = (torch.nn.functional.normalize(torch.randn(512, 32), dim=-1) * 32 ** 0.5).requires_grad_(True)
+    assert mo.sigreg(sph) < 3, "unit vectors scaled by the square root of the size must pass as Gaussian"
+    mo.sigreg(sph).backward()
+    assert torch.isfinite(sph.grad).all() and sph.grad.abs().sum() > 0
+    sig = mo.build_model(32, 64, z_down=(0, 0, 1, 1), align=True, align_loss="jepa", sigreg=0.05)
+    assert sig.sigreg == 0.05 and set(sig.state_dict()) == set(online), "SIGReg must add no weights"
+    dense, whole, reg = sig.terms(xa, (simg, sgrid))
+    assert torch.isfinite(reg) and reg > 0
+    reg.backward()
+    assert sig.oct_dense.weight.grad is not None and sig.slo_dense.weight.grad is not None and sig.unet.conv_in.conv.weight.grad is not None
+    assert fails(lambda: mo.build_model(32, 64, align=True, sigreg=0.05)).startswith("SIGReg goes with the JEPA loss only")
+    assert mo.model_args({"design": "w2z1", "slo_size": 64, "slo_align": 0.1, "slo_align_loss": "jepa", "slo_sigreg": 0.05})["sigreg"] == 0.05
+    assert mo.model_args({"design": "w2z1", "slo_size": 64, "slo_align": 0.1, "slo_align_loss": "jepa"})["sigreg"] == 0.0
     import importlib.util
     spec = importlib.util.spec_from_file_location("train_script", os.path.join(REPO, "scripts", "train.py"))
     tr = importlib.util.module_from_spec(spec)
@@ -1112,14 +1128,35 @@ def test_slo_runs(root, tmp):
     assert code != 0 and "loss jepa" in out, out
     code, out = run(*[a if a != je_run else os.path.join(tmp, "run_jepa_noalign") for a in je_base if a not in ("--slo-align", "0.1")], "--epochs", "1")
     assert code != 0 and "--slo-align-loss needs --slo-align" in out, out
+    code, out = run(*je_base, "--epochs", "3", "--auto-resume", "--slo-sigreg", "0.05")
+    assert code != 0 and "SIGReg weight 0" in out, out
+    sg_run = os.path.join(tmp, "run_align_sigreg")
+    sg_base = [a if a != je_run else sg_run for a in je_base] + ["--slo-sigreg", "0.05"]
+    code, out = run(*sg_base, "--epochs", "1")
+    assert code == 0 and "JEPA-style latent prediction with SIGReg 0.05 loss (weight 0.1)" in out and "(SIGReg " in out and "same place: own SLO" in out, out
+    no_leak(out, "train the JEPA model with SIGReg")
+    print(out)
+    ckpt = torch.load(os.path.join(sg_run, "latest.pt"), map_location="cpu", weights_only=False)
+    assert ckpt["slo_sigreg"] == 0.05 and all(torch.isfinite(v).all() for v in ckpt["model"].values())
+    code, out = run(*sg_base, "--epochs", "2", "--auto-resume")
+    assert code == 0 and "resumed after epoch 1" in out, out
+    code, out = run(*sg_base[:-2], "--epochs", "3", "--auto-resume")
+    assert code != 0 and "SIGReg weight 0.05" in out, out
+    code, out = run(*[a if a != sg_run else os.path.join(tmp, "run_sigreg_contrastive") for a in sg_base if a not in ("--slo-align-loss", "jepa")], "--epochs", "1")
+    assert code != 0 and "--slo-sigreg needs --slo-align-loss jepa" in out, out
+    code, out = run(*[a if a != "0.05" else "1" for a in sg_base], "--epochs", "1")
+    assert code != 0 and "--slo-sigreg takes a weight from 0 to below 1" in out, out
+    code, out = run("scripts/downstream.py", "--run", sg_run, "--root", root, "--task", "righteye", "--workers", "0", "--n-boot", "50")
+    assert code == 0 and "aligned encoder (jepa)" in out and "feature size 560" in out and "test auroc" in out, out
+    no_leak(out, "downstream on the SIGReg model")
     code, out = run("scripts/sample.py", "--run", je_run, "--root", root, "--n-samples", "1", "--ddim-steps", "2", "--n-eval", "2")
     assert code == 0 and "aligned encoder (jepa), not fed to the denoiser" in out and "images written: 2" in out, out
     for extra, size in ((["--slo-features"], 720), (["--slo-features", "--random-init"], 720), (["--mode", "finetune", "--epochs", "1"], 560)):
         code, out = run("scripts/downstream.py", "--run", je_run, "--root", root, "--task", "righteye", "--workers", "0", "--n-boot", "50", *extra)
         assert code == 0 and "aligned encoder (jepa)" in out and "feature size %d" % size in out and "test auroc" in out, out
         no_leak(out, "downstream on the JEPA-aligned model")
-    code, out = run("scripts/retrieval.py", "--run", al_run, je_run, "--root", root, "--workers", "0", "--n-perm", "50")
-    assert code == 0 and "aligned encoder (contrastive)" in out and "aligned encoder (jepa)" in out and out.count("retrieval among") == 2 and "same place  OCT to SLO" in out and "whole scan  SLO to OCT" in out, out
+    code, out = run("scripts/retrieval.py", "--run", al_run, je_run, sg_run, "--root", root, "--workers", "0", "--n-perm", "50")
+    assert code == 0 and "aligned encoder (contrastive)" in out and "aligned encoder (jepa)" in out and out.count("retrieval among") == 3 and "same place  OCT to SLO" in out and "whole scan  SLO to OCT" in out, out
     no_leak(out, "retrieval on the aligned models")
     print(out)
     with open(os.path.join(al_run, "retrieval", "retrieval_test.json")) as f:

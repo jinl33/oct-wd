@@ -13,6 +13,8 @@ ALIGN_STAGE = 2
 ALIGN_DIM = 128
 ALIGN_TEMP = 0.1
 JEPA_MOMENTUM = 0.996
+SIGREG_SLICES = 256
+SIGREG_KNOTS = 17
 
 
 class ZUpsample(torch.nn.Module):
@@ -310,9 +312,21 @@ def latent_distance(p, z):
     return 2 - 2 * (F.normalize(p.float(), dim=-1) * z).sum(-1)
 
 
+def sigreg(x, slices=SIGREG_SLICES, knots=SIGREG_KNOTS):
+    with torch.amp.autocast(x.device.type, enabled=False):
+        a = torch.randn(x.shape[1], slices, device=x.device)
+        a = a / a.norm(dim=0)
+        t = torch.linspace(-5, 5, knots, device=x.device)
+        phi = torch.exp(-0.5 * t ** 2)
+        xt = (x.float() @ a).unsqueeze(2) * t
+        err = (torch.cos(xt).mean(0) - phi).square() + torch.sin(xt).mean(0).square()
+        return (torch.trapz(err * phi, t, dim=1) * x.shape[0]).mean()
+
+
 class JepaAligned(AlignedDiffusion):
-    def __init__(self, n_channels, z_down=Z_DOWN, dim=ALIGN_DIM):
+    def __init__(self, n_channels, z_down=Z_DOWN, dim=ALIGN_DIM, sigreg=0.0):
         super().__init__(n_channels, z_down, dim)
+        self.sigreg = sigreg
         target = AlignedDiffusion(n_channels, z_down, dim)
         target.load_state_dict(self.state_dict())
         for p in target.parameters():
@@ -329,7 +343,11 @@ class JepaAligned(AlignedDiffusion):
             ot, vt, _, got, gst = self.target.embed(x0, slo)
         dense = (latent_distance(self.oct_to_slo(o), vt)[valid].mean() + latent_distance(self.slo_to_oct(v), ot)[valid].mean()) / 2
         whole = (latent_distance(self.whole_oct_to_slo(go), gst).mean() + latent_distance(self.whole_slo_to_oct(gs), got).mean()) / 2
-        return dense, whole
+        reg = dense.new_zeros(())
+        if self.sigreg:
+            scale = o.shape[-1] ** 0.5
+            reg = (sigreg(o[valid] * scale) + sigreg(v[valid] * scale)) / 2
+        return dense, whole, reg
 
     def match(self, x0, slo):
         o, _, valid, go, _ = self.embed(x0, slo)
@@ -380,7 +398,7 @@ class SloDiffusion(torch.nn.Module):
         return decode(self.unet, h, skips, emb, context)
 
 
-def build_model(n_channels, slo_size=0, adapter=False, z_down=Z_DOWN, tokens=8, dim=CONTEXT_DIM, xattn=(), part=None, align=False, align_loss="contrastive"):
+def build_model(n_channels, slo_size=0, adapter=False, z_down=Z_DOWN, tokens=8, dim=CONTEXT_DIM, xattn=(), part=None, align=False, align_loss="contrastive", sigreg=0.0):
     if (adapter or xattn) and not slo_size:
         raise ValueError("the SLO adapter and SLO cross-attention need an SLO size")
     if align:
@@ -388,7 +406,9 @@ def build_model(n_channels, slo_size=0, adapter=False, z_down=Z_DOWN, tokens=8, 
             raise ValueError("the aligned model needs an SLO size and no SLO adapter, cross-attention or SLO slice")
         if align_loss not in ("contrastive", "jepa"):
             raise ValueError("unknown alignment loss %s" % align_loss)
-        return JepaAligned(n_channels, z_down) if align_loss == "jepa" else AlignedDiffusion(n_channels, z_down)
+        if sigreg and align_loss != "jepa":
+            raise ValueError("SIGReg goes with the JEPA loss only")
+        return JepaAligned(n_channels, z_down, sigreg=sigreg) if align_loss == "jepa" else AlignedDiffusion(n_channels, z_down)
     if part is not None:
         if slo_size:
             raise ValueError("an own noise step for the SLO slice needs the joint model, without an SLO encoder")
@@ -453,13 +473,13 @@ class Encoder(torch.nn.Module):
 def options(ckpt):
     return {"adapter": bool(ckpt.get("slo_adapter", False)), "keep": int(ckpt.get("keep_slices", 0)), "z_down": tuple(ckpt.get("z_down", Z_DOWN)),
             "tokens": int(ckpt.get("slo_tokens", 8)), "dim": int(ckpt.get("slo_dim", CONTEXT_DIM)), "xattn": tuple(ckpt.get("slo_xattn", ())), "slo_slice": ckpt.get("slo_slice"),
-            "own_step": bool(ckpt.get("slo_own_step", False)), "align": float(ckpt.get("slo_align", 0.0)), "align_loss": ckpt.get("slo_align_loss", "contrastive")}
+            "own_step": bool(ckpt.get("slo_own_step", False)), "align": float(ckpt.get("slo_align", 0.0)), "align_loss": ckpt.get("slo_align_loss", "contrastive"), "sigreg": float(ckpt.get("slo_sigreg", 0.0))}
 
 
 def model_args(ckpt):
     opt = options(ckpt)
     part = joint_parts(ckpt, wv.DESIGNS[ckpt["design"]])[1] if opt["own_step"] else None
-    return dict(slo_size=ckpt.get("slo_size", 0), adapter=opt["adapter"], z_down=opt["z_down"], tokens=opt["tokens"], dim=opt["dim"], xattn=opt["xattn"], part=part, align=opt["align"] > 0, align_loss=opt["align_loss"])
+    return dict(slo_size=ckpt.get("slo_size", 0), adapter=opt["adapter"], z_down=opt["z_down"], tokens=opt["tokens"], dim=opt["dim"], xattn=opt["xattn"], part=part, align=opt["align"] > 0, align_loss=opt["align_loss"], sigreg=opt["sigreg"])
 
 
 def joint_parts(ckpt, axes):

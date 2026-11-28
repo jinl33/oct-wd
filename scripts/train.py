@@ -42,6 +42,7 @@ def parse():
     ap.add_argument("--slo-slice", default=None, choices=("raster", "full"), help="joint model: append the SLO as its own slice after the B-scans, resampled onto the scan raster (raster) or whole (full); needs an even number of B-scans and two free slices in --target")
     ap.add_argument("--slo-align", type=float, default=0.0, help="weight of a contrastive loss that aligns the OCT encoder with a separate SLO encoder, at each place along the scan lines and over the whole scan; the SLO is not fed to the denoiser; needs --slo-size")
     ap.add_argument("--slo-align-loss", default="contrastive", choices=("contrastive", "jepa"), help="with --slo-align: contrastive (InfoNCE, other scans and places as negatives) or jepa (each modality predicts the other's features from slowly updated copies of the encoders, no negatives)")
+    ap.add_argument("--slo-sigreg", type=float, default=0.0, help="with --slo-align-loss jepa: weight lambda of SIGReg (LeJEPA's guard against collapse) on the OCT and SLO features at each place; the alignment term becomes (1 - lambda) x prediction + lambda x SIGReg; LeJEPA uses 0.05")
     ap.add_argument("--slo-own-step", action="store_true", help="joint model: give the SLO slice its own noise step, drawn apart from the OCT's, so the model also learns the OCT given a clean SLO; needs --slo-slice")
     ap.add_argument("--slo-clean", type=float, default=0.25, help="with --slo-own-step: share of training scans whose SLO slice is left clean")
     ap.add_argument("--slo-same", type=float, default=0.25, help="with --slo-own-step: share of training scans whose SLO slice gets the OCT's noise step; the rest get an independent step")
@@ -185,6 +186,10 @@ def main():
         raise SystemExit("--slo-align needs --slo-size")
     if args.slo_align_loss != "contrastive" and not aligned:
         raise SystemExit("--slo-align-loss needs --slo-align")
+    if args.slo_sigreg and args.slo_align_loss != "jepa":
+        raise SystemExit("--slo-sigreg needs --slo-align-loss jepa")
+    if not 0 <= args.slo_sigreg < 1:
+        raise SystemExit("--slo-sigreg takes a weight from 0 to below 1")
     if aligned and (args.slo_adapter or args.slo_xattn or args.slo_slice):
         raise SystemExit("--slo-align keeps the SLO out of the denoiser; leave out --slo-adapter, --slo-xattn and --slo-slice")
 
@@ -226,8 +231,8 @@ def main():
             raise SystemExit("latest.pt was trained with SLO adapter %s, slices kept %s, slice-axis halving %s" % ("on" if saved["adapter"] else "off", saved["keep"] or "all", " ".join(map(str, saved["z_down"]))))
         if (saved["tokens"], saved["dim"], tuple(sorted(saved["xattn"])), saved["slo_slice"]) != (args.slo_tokens, args.slo_dim, tuple(sorted(set(args.slo_xattn))), args.slo_slice):
             raise SystemExit("latest.pt was trained with SLO tokens %d, token size %d, cross-attention levels %s, SLO slice %s" % (saved["tokens"], saved["dim"], " ".join(map(str, saved["xattn"])) or "none", saved["slo_slice"] or "none"))
-        if saved["align"] != args.slo_align or (aligned and saved["align_loss"] != args.slo_align_loss):
-            raise SystemExit("latest.pt was trained with SLO alignment weight %g%s" % (saved["align"], ", loss %s" % saved["align_loss"] if saved["align"] else ""))
+        if saved["align"] != args.slo_align or (aligned and (saved["align_loss"], saved["sigreg"]) != (args.slo_align_loss, args.slo_sigreg)):
+            raise SystemExit("latest.pt was trained with SLO alignment weight %g%s" % (saved["align"], ", loss %s, SIGReg weight %g" % (saved["align_loss"], saved["sigreg"]) if saved["align"] else ""))
         if saved["own_step"] != args.slo_own_step:
             raise SystemExit("latest.pt was trained %s an own noise step for the SLO slice" % ("with" if saved["own_step"] else "without"))
 
@@ -239,7 +244,7 @@ def main():
         raise SystemExit(str(e))
     slo_text = "not used"
     if aligned:
-        slo_text = "%d px, own encoder aligned with the OCT encoder by a %s loss (weight %g), not fed to the denoiser" % (args.slo_size, "contrastive" if args.slo_align_loss == "contrastive" else "JEPA-style latent prediction", args.slo_align)
+        slo_text = "%d px, own encoder aligned with the OCT encoder by a %s loss (weight %g), not fed to the denoiser" % (args.slo_size, "contrastive" if args.slo_align_loss == "contrastive" else "JEPA-style latent prediction" + (" with SIGReg %g" % args.slo_sigreg if args.slo_sigreg else ""), args.slo_align)
     elif conditioned:
         slo_text = "%d px" % args.slo_size + (", %d tokens of %d" % (args.slo_tokens ** 2, args.slo_dim) if (args.slo_tokens, args.slo_dim) != (8, CONTEXT_DIM) else "") + (", adapter" if args.slo_adapter else "") + (", cross-attention at levels %s" % " ".join(map(str, sorted(set(args.slo_xattn)))) if args.slo_xattn else "")
     elif args.slo_slice:
@@ -298,7 +303,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(OctVolumes(train_scans, args.target, args.slo_size, **data), shuffle=True, drop_last=True, **loader_args)
     val_loader = torch.utils.data.DataLoader(OctVolumes(val_scans, args.target, args.slo_size, other=conditioned, **data), shuffle=False, **loader_args)
 
-    model = build_model(n_ch, args.slo_size, args.slo_adapter, tuple(args.z_down), args.slo_tokens, args.slo_dim, sorted(set(args.slo_xattn)), joint[1] if args.slo_own_step else None, aligned, args.slo_align_loss).to(device)
+    model = build_model(n_ch, args.slo_size, args.slo_adapter, tuple(args.z_down), args.slo_tokens, args.slo_dim, sorted(set(args.slo_xattn)), joint[1] if args.slo_own_step else None, aligned, args.slo_align_loss, args.slo_sigreg).to(device)
     print("parameters: %d" % sum(p.numel() for p in model.parameters()))
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -315,7 +320,7 @@ def main():
 
     for epoch in range(start_epoch + 1, args.epochs + 1):
         started = time.time()
-        total, total_align, steps = 0.0, 0.0, 0
+        total, total_align, total_reg, steps = 0.0, 0.0, 0.0, 0
         if use_amp:
             torch.cuda.reset_peak_memory_stats()
         opt.zero_grad(set_to_none=True)
@@ -348,8 +353,12 @@ def main():
                     loss = ((pred.float() - x0).pow(2) * weight).sum() / (weight.sum() * x0.shape[1])
                 mse = loss
                 if aligned:
-                    dense, whole = model.terms(x0, slo) if args.slo_align_loss == "jepa" else align_loss(*model.embed(x0, slo))
-                    contrast = (dense + whole) / 2
+                    if args.slo_align_loss == "jepa":
+                        dense, whole, reg = model.terms(x0, slo)
+                        contrast = (1 - args.slo_sigreg) * (dense + whole) / 2 + args.slo_sigreg * reg
+                    else:
+                        dense, whole = align_loss(*model.embed(x0, slo))
+                        contrast = (dense + whole) / 2
                     loss = mse + args.slo_align * contrast
             if not torch.isfinite(loss):
                 raise SystemExit("non-finite loss at epoch %d step %d" % (epoch, step))
@@ -363,6 +372,8 @@ def main():
             total += mse.item()
             if aligned:
                 total_align += contrast.item()
+                if args.slo_sigreg:
+                    total_reg += reg.item()
             steps += 1
         if steps < args.accum:
             raise SystemExit("no optimizer step ran: fewer batches than --accum")
@@ -377,12 +388,12 @@ def main():
         else:
             shown = "val mse %.6f" % val["none"]
         if aligned:
-            shown = "align loss %.4f  %s  same place: own SLO %.3f  another scan's %.3f  whole scan: own %.3f  others %.3f  own SLO ranked first %d of %d" % (
-                total_align / steps, shown, val["near_own"], val["near_other"], val["whole_own"], val["whole_other"], val["top1"], val["n_whole"])
+            shown = "align loss %.4f%s  %s  same place: own SLO %.3f  another scan's %.3f  whole scan: own %.3f  others %.3f  own SLO ranked first %d of %d" % (
+                total_align / steps, " (SIGReg %.3f)" % (total_reg / steps) if args.slo_sigreg else "", shown, val["near_own"], val["near_other"], val["whole_own"], val["whole_other"], val["top1"], val["n_whole"])
         print("epoch %d: train mse %.6f  %s  %.0f s  peak %.2f GiB  steps %d" % (epoch, total / steps, shown, time.time() - started, peak, steps), flush=True)
 
         path = os.path.join(args.out, "epoch_%04d.pt" % epoch)
-        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist(), "band_rms": None if rms is None else rms.tolist(), "band_power": args.band_scale, "slo_adapter": args.slo_adapter, "keep_slices": args.keep_slices, "z_down": list(args.z_down), "slo_tokens": args.slo_tokens, "slo_dim": args.slo_dim, "slo_xattn": sorted(set(args.slo_xattn)), "slo_slice": args.slo_slice, "slo_own_step": args.slo_own_step, "slo_clean": args.slo_clean, "slo_same": args.slo_same, "slo_align": args.slo_align, "slo_align_loss": args.slo_align_loss}
+        state = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "design": args.design, "target": args.target, "slo_size": args.slo_size, "band_scale": None if band is None else band.tolist(), "band_rms": None if rms is None else rms.tolist(), "band_power": args.band_scale, "slo_adapter": args.slo_adapter, "keep_slices": args.keep_slices, "z_down": list(args.z_down), "slo_tokens": args.slo_tokens, "slo_dim": args.slo_dim, "slo_xattn": sorted(set(args.slo_xattn)), "slo_slice": args.slo_slice, "slo_own_step": args.slo_own_step, "slo_clean": args.slo_clean, "slo_same": args.slo_same, "slo_align": args.slo_align, "slo_align_loss": args.slo_align_loss, "slo_sigreg": args.slo_sigreg}
         torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
         torch.save(state, latest + ".tmp")
